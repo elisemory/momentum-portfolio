@@ -1,0 +1,33 @@
+name: Refresh data
+
+on:
+  schedule:
+    - cron: "0 10 1 * *"  # 1st of each month, 10:00 UTC (06:00 New York)
+  workflow_dispatch:
+
+permissions:
+  contents: write  # publish the data release
+
+concurrency: refresh-data
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Restore last published data
+        run: python -m momentum.live --download
+      - name: Refresh prices and index membership
+        run: python -m momentum.live --refresh
+      - name: Publish data release
+        run: |
+          python -m momentum.live --pack /tmp/momentum-data.tar.gz
+          gh release upload data-latest /tmp/momentum-data.tar.gz --clobber

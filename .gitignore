@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+# market data is published as a release asset (see README), not committed
+data/
+*.log
+.streamlit/secrets.toml
