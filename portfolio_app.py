@@ -73,7 +73,6 @@ def start_scheduler() -> threading.Thread:
     return th
 
 
-start_scheduler()
 
 if not (data.DATA_DIR / "close.parquet").exists():
     with st.status("First run: loading price history…", expanded=True):
@@ -81,6 +80,8 @@ if not (data.DATA_DIR / "close.parquet").exists():
             st.write("Downloading 30 years of prices from Yahoo (a few minutes)…")
             data.fetch_all(log=st.write)
             run_refresh(st.write)
+
+start_scheduler()  # only once data exists, so it never races the first-run download
 
 
 def data_version() -> tuple:
