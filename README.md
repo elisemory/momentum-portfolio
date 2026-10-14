@@ -36,7 +36,9 @@ The `data/` folder is already filled. To re-download data, click **Download / re
 
 | File | Purpose |
 |---|---|
-| `momentum/data.py` | Point-in-time S&P 500 membership ([fja05680/sp500](https://github.com/fja05680/sp500)), Yahoo adjusted prices, and annual fundamentals for the quality gate |
+| `momentum/data.py` | Point-in-time S&P 500 membership ([fja05680/sp500](https://github.com/fja05680/sp500)), Yahoo adjusted prices (plus the WIKI supplement), ticker renames, and annual fundamentals for the quality gate |
+| `momentum/supplement.py` | Builds the price supplement for former members Yahoo dropped, from the frozen Quandl WIKI archive. Run `python -m momentum.supplement --wiki data/archive/wiki_prices.zip` |
+| `momentum/sector_etf.py` | Runs the same rules on the SPDR sector ETFs, for comparison. Run `python -m momentum.sector_etf --fetch` |
 | `momentum/backtest.py` | Engine. `Config` holds every parameter. `run(cfg)` returns NAV, holdings, and trades. `live_signal(cfg)` returns today's ranking |
 | `momentum/metrics.py` | CAGR, Sharpe, Sortino, drawdowns, calendar tables, and turnover |
 | `momentum/live.py` | Data refresh, monthly schedule, current portfolio, and next-rebalance trades |
@@ -53,6 +55,29 @@ r = bt.run(bt.Config(vol_target=0.15, score="risk_adjusted"))
 print(mt.summary(r.nav, r.cash_rate, r.bench))
 ```
 
+## Verifying the backtest
+
+Run `.venv/bin/python -m unittest discover -s tests -v` to check the independent audit
+calculations against small hand-calculated examples. Then run
+`.venv/bin/python -m momentum.verify` (several minutes). This creates a new ignored
+`verification_runs/<UTC timestamp>/` directory containing:
+
+- A frozen copy of the working-tree source and data, a SHA-256 manifest, and installed package versions.
+- `report.html` and `results.json`, separating reproduced results from independently checked calculations.
+- All published variants and tax scenarios; daily cash/holdings reconciliation; fill and monthly signal audits.
+- Spreadsheet-readable worksheets for ordinary, exit, re-entry and missing-price months.
+- Physical input-truncation checks and a control that alters only future prices.
+- SPY versus momentum, with and without the same regime filter, at 10/25/50 bps per side.
+- An optional public Kenneth French market-return comparison (use `--offline` to skip downloading).
+- A timestamped frozen strategy/preview record and a blank prospective fills template. These do not
+  execute orders, schedule future work, or establish prospective investment performance.
+
+The audit executes inside the frozen source copy and never refreshes production data. The checks
+use the same stock-price source: a second stock-level dataset with delisting returns is still needed
+to validate vendor history. The public market comparison is only a benchmark sanity check.
+Published tax scenarios are reproduced but not independently validated; the stock sleeve does not
+separately tax dividends embedded in adjusted prices. Output returns are decimal fractions.
+
 ## Timing
 
 - **Signal:** computed on the close of the last trading day of the month. Momentum is P(end of M-2) / P(end of M-13) - 1, and the regime check is S&P 500 close > SMA200.
@@ -65,33 +90,42 @@ See the **Data & caveats** tab for known biases.
 
 Run `python -m momentum.experiments` to reproduce these numbers. The **Compare variants** tab shows the same table.
 
-**Diagnosis.** The spec beat the S&P 500 by 12 points a year in 1996–2010 but trailed it by 5 points a year from 2011 on. The cause is the 200-day regime filter. Since 2011 it has fired on short corrections, and the S&P rose an average of 2.5% in the month after each exit.
+**Diagnosis.** The spec beat the S&P 500 by 12 points a year in 1996–2010 but trailed it by 4 points a year from 2011 on. The cause is the 200-day regime filter. Since 2011 it has fired on short corrections, and the S&P rose an average of 2.3% in the months it kept the strategy in T-bills.
 
 **Improved preset:** `score="blend", regime_rule="sma_slope", max_weight=0.10`
 
 | | CAGR | Sharpe | Max drawdown | CAGR 1996–2010 | CAGR 2011–now |
 |---|---|---|---|---|---|
-| Spec as written | 13.8% | 0.59 | −34% | 18.5% | 9.1% |
-| Improved | 17.7% | 0.71 | −36% | 18.7% | 16.9% |
+| Spec as written | 14.3% | 0.61 | −33% | 18.7% | 10.3% |
+| Improved | 18.1% | 0.72 | −39% | 20.1% | 16.4% |
 | S&P 500 (SPY) | 10.4% | 0.49 | −55% | 6.4% | 14.1% |
 
 - **Blend score:** ranks stocks on the average percentile rank of 12-1 and 6-1 momentum.
 - **Falling-SMA regime rule:** a bear market is declared only when the S&P 500 is below its 200-day SMA *and* that SMA is lower than it was 21 trading days ago. It still caught 2000–02, 2008, and 2022, and it ignored most short corrections.
-- **10% position cap:** trims runaway winners.
+- **10% position cap:** trims runaway winners. It's a risk limit; on the current data it no longer adds return.
 
-**Robustness.** The gain holds for slope lookbacks of 5–63 days, SMA lengths of 150–250, trading costs of 25 bps, and buffers of 30–60. Across all of those, full-period CAGR stays between 16% and 18%. The worst drawdown is the COVID crash in February–March 2020, which happened within a single month, so no monthly rule could have avoided it.
+**Robustness.** The gain holds for slope lookbacks of 5–63 days, SMA lengths of 150–250, trading costs of 25 bps, and buffers of 30–60. Across all of those, full-period CAGR stays between 16.5% and 18%. The worst drawdown is the COVID crash in February–March 2020, which happened within a single month, so no monthly rule could have avoided it.
 
 **Tested and rejected:**
 - Daily regime checks: heavy whipsaw.
 - 52-week-high and smooth-momentum scores.
 - Volatility targeting and inverse-volatility weights: lower risk, but also lower return.
 - Sector caps: cut returns by 3–4 points a year.
+- Residual momentum (net of market or sector moves): less concentrated, but 5–6 points a year lower.
+- Rotating sector ETFs instead of stocks: about half the return since 2011.
 
-**Caveat.** Roughly 40 variants were tried, and the falling-SMA rule was chosen after seeing where the spec failed. The 2011–now half is therefore not truly out-of-sample for that rule. Expect live results to fall short of the backtest.
+**Caveat.** Roughly 45 variants were tried, and the falling-SMA rule was chosen after seeing where the spec failed. The 2011–now half is therefore not truly out-of-sample for that rule. Expect live results to fall short of the backtest.
 
 ## Data cleaning
 
 Some delisted S&P 500 tickers were later reused by other companies, such as MCIC, CPWR, COMS, PARA, and EP. Yahoo returns the new owner's history for those symbols. They're excluded through `data.BLOCKLIST` and an automatic check for extreme price jumps.
+
+Yahoo also deletes the history of stocks that stop trading, so many former members have no prices (survivorship bias). Two partial fixes:
+
+- **Renamed tickers:** `data.RENAMES` maps members listed under an old symbol (for example `FB`) to the symbol Yahoo keeps their history under (`META`).
+- **Price supplement:** `data/supplement_*.parquet` holds prices from the frozen Quandl WIKI archive (through February 2018) for 184 former members. `data.load_prices()` merges it in. It's built locally from the WIKI bulk export, never written into the Yahoo files, and not part of the published data bundle, so the hosted app runs on Yahoo data only. The archive itself is kept in `data/archive/` (ignored by git).
+
+Pre-2010 failures (Lehman, Enron and others) are still missing; see FINDINGS.md section 8.
 
 ## Deployment (Streamlit Community Cloud)
 

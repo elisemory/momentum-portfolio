@@ -5,3 +5,4 @@ __pycache__/
 data/
 *.log
 .streamlit/secrets.toml
+verification_runs/

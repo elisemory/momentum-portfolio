@@ -5,7 +5,6 @@ Run:  .venv/bin/streamlit run app.py
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -63,7 +62,7 @@ with st.sidebar:
         with st.status("Fetching data…", expanded=True) as status:
             data.fetch_all(log=st.write, fundamentals=st.session_state.get("fetch_fund", False))
             status.update(label="Done", state="complete")
-        bt.load_market.cache_clear(); bt._membership.cache_clear(); bt._quality.cache_clear()
+        bt.clear_caches()
         st.cache_data.clear()
         st.rerun()
     st.checkbox("Also refresh fundamentals (slow, ~3 min)", key="fetch_fund")
@@ -82,7 +81,9 @@ REGIME_RULES = {
     "faber": "Below 10-month SMA",
 }
 SCORES = {"raw": "12-1 return only", "blend": "Blend of 12-1 and 6-1", "risk_adjusted": "12-1 ÷ volatility",
-          "smooth": "Smooth momentum (FIP)", "high52": "Near 52-week high"}
+          "smooth": "Smooth momentum (FIP)", "high52": "Near 52-week high",
+          "residual": "Residual momentum (net of market)",
+          "residual_sector": "Residual momentum (net of market and sector)"}
 
 with st.sidebar:
     st.caption("Defaults are the Improved strategy: 12-1/6-1 blend, bear regime only when the 200-day SMA is "
@@ -92,8 +93,19 @@ with st.sidebar:
 
     st.header("Strategy")
     c1, c2 = st.columns(2)
-    start = c1.date_input("Start", date(1996, 2, 1), min_value=date(1995, 2, 1), max_value=m.dates[-1].date())
-    end = c2.date_input("End", m.dates[-1].date(), min_value=date(1996, 2, 1), max_value=m.dates[-1].date())
+    # month pickers instead of calendars: any month from Feb 1996 up to last month, type to search
+    last_full = m.dates[-1].to_period("M") - 1
+    months = [str(x) for x in pd.period_range("1996-02", last_full, freq="M")]
+    start_m = c1.selectbox("Start", months, index=0, key=K("start"),
+                           format_func=lambda x: pd.Period(x).strftime("%b %Y"),
+                           help="The backtest starts on the first trading day of this month. Type to search, "
+                                "e.g. '2025'.")
+    ends = ["latest"] + [str(x) for x in pd.period_range(start_m, last_full, freq="M")][::-1]
+    end_m = c2.selectbox("End", ends, index=0, key=K("end"),
+                         format_func=lambda x: f"Latest ({m.dates[-1]:%b %d})" if x == "latest"
+                         else "End of " + pd.Period(x).strftime("%b %Y"))
+    start = pd.Period(start_m).start_time.date()
+    end = m.dates[-1].date() if end_m == "latest" else pd.Period(end_m).end_time.date()
     universe = st.radio("Universe", ["pit", "current"], horizontal=True, key=K("universe"),
                         format_func=lambda x: {"pit": "Point-in-time members", "current": "Today's members"}[x],
                         help="'Today's members' suffers survivorship bias: "
@@ -186,8 +198,11 @@ st.title("Improved 12-1 Momentum vs. S&P 500 & Nasdaq")
 st.caption(f"{nav.index[0].date()} → {nav.index[-1].date()} · total-return prices · fills at the open on the "
            f"first trading day of each month · {cost_bps:g} bps/side costs · idle cash earns 13-week T-bill yield")
 
+years = (nav.index[-1] - nav.index[0]).days / 365.25
+RET = "CAGR" if years >= 1 else "Total return"  # don't annualise periods shorter than a year
+RET_LABEL = "CAGR" if years >= 1 else "Return (not annualized)"
 k = st.columns(6)
-k[0].metric("CAGR", pct(S["CAGR"]), f"{(S['CAGR'] - B['CAGR']) * 100:+.1f} pts vs S&P")
+k[0].metric(RET_LABEL, pct(S[RET]), f"{(S[RET] - B[RET]) * 100:+.1f} pts vs S&P")
 k[1].metric("Sharpe", f"{S['Sharpe']:.2f}", f"{S['Sharpe'] - B['Sharpe']:+.2f} vs S&P")
 k[2].metric("Max drawdown", pct(S["Max drawdown"]), f"{(S['Max drawdown'] - B['Max drawdown']) * 100:+.1f} pts vs S&P")
 k[3].metric("Volatility", pct(S["Volatility"]), f"{(S['Volatility'] - B['Volatility']) * 100:+.1f} pts vs S&P",
@@ -195,7 +210,7 @@ k[3].metric("Volatility", pct(S["Volatility"]), f"{(S['Volatility'] - B['Volatil
 k[4].metric("Turnover / yr", pct(mt.turnover_per_year(rebals), 0), help="One-sided: average of buys and sells, ÷ NAV")
 k[5].metric("$100k became", f"${S['Final value'] / 1e6:,.2f}M", f"S&P: ${B['Final value'] / 1e6:,.2f}M",
             delta_color="off")
-st.caption(f"**vs Nasdaq-100:** CAGR {(S['CAGR'] - N['CAGR']) * 100:+.1f} pts ({pct(N['CAGR'])}) · "
+st.caption(f"**vs Nasdaq-100:** {RET_LABEL} {(S[RET] - N[RET]) * 100:+.1f} pts ({pct(N[RET])}) · "
            f"Sharpe {S['Sharpe'] - N['Sharpe']:+.2f} ({N['Sharpe']:.2f}) · "
            f"Max drawdown {(S['Max drawdown'] - N['Max drawdown']) * 100:+.1f} pts ({pct(N['Max drawdown'])}) · "
            f"$100k → ${N['Final value'] / 1e6:,.2f}M. Before QQQ launched (Mar 1999) the Nasdaq-100 price index is used.")
@@ -296,8 +311,11 @@ with tabs[2]:
 with tabs[3]:
     dates_ = sorted(holdings["date"].unique())
     if dates_:
-        sel = st.select_slider("Rebalance date", options=[pd.Timestamp(d).date() for d in dates_],
-                               value=pd.Timestamp(dates_[-1]).date())
+        if len(dates_) > 1:
+            sel = st.select_slider("Rebalance date", options=[pd.Timestamp(d).date() for d in dates_],
+                                   value=pd.Timestamp(dates_[-1]).date())
+        else:
+            sel = pd.Timestamp(dates_[0]).date()
         h = holdings[holdings["date"] == pd.Timestamp(sel)].sort_values("weight", ascending=False)
         rrow = rebals.loc[pd.Timestamp(sel)]
         c1, c2 = st.columns([2, 3])

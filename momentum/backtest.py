@@ -190,6 +190,58 @@ def _sector_codes() -> np.ndarray:
     return np.array([sec.get(t, "Unknown") for t in m.tickers], dtype=object)
 
 
+def clear_caches() -> None:
+    """Drop everything derived from the files in data/; call after any data refresh."""
+    for f in (load_market, _membership, _quality, _regime_inputs, _sector_codes, _monthly_returns):
+        f.cache_clear()
+
+
+@lru_cache(maxsize=1)
+def _monthly_returns() -> tuple[np.ndarray, np.ndarray]:
+    """(stock returns [month x ticker], SPY total return [month]) aligned with Market.month_end."""
+    m = load_market()
+    r = m.month_end.pct_change(fill_method=None).to_numpy()
+    mkt = m.bench_close.groupby(m.dates.to_period("M")).last().pct_change()
+    return r, mkt.reindex(m.month_end.index).to_numpy()
+
+
+def residual_momentum(m: Market, month: pd.Period, cols: np.ndarray, lookback: int, skip: int,
+                      sectors: np.ndarray | None = None, window: int = 36, min_obs: int = 24) -> np.ndarray:
+    """Blitz, Huij & Martens (2011): regress each stock's monthly returns over the last `window`
+    months on SPY (and, with `sectors`, on the equal-weighted return of the rest of its sector),
+    then score = sum of residuals over the 12-1 window / their standard deviation. Uses month-end
+    closes through month - 1 only. NaN where history is too short."""
+    k = m.month_end.index.get_indexer([month - 1])[0]
+    out = np.full(len(cols), np.nan)
+    if k < window:
+        return out
+    r, mkt = _monthly_returns()
+    Y = r[k - window + 1 : k + 1][:, cols]
+    x = mkt[k - window + 1 : k + 1]
+    form = slice(window - lookback, window - skip)  # rows of months M-lookback .. M-1-skip
+    if sectors is not None:
+        sec = sectors[cols]
+        sec_ret = np.full_like(Y, np.nan)
+        for name in set(sec) - {"Unknown"}:
+            g = sec == name
+            ok = np.isfinite(Y[:, g])
+            tot, n = np.where(ok, Y[:, g], 0).sum(1, keepdims=True), ok.sum(1, keepdims=True)
+            with np.errstate(invalid="ignore", divide="ignore"):  # leave the stock itself out
+                sec_ret[:, g] = np.where(n - ok > 0, (tot - np.where(ok, Y[:, g], 0)) / (n - ok), np.nan)
+    for i in range(len(cols)):
+        y = Y[:, i]
+        cols_x = [np.ones(window), x] + ([sec_ret[:, i]] if sectors is not None and sec[i] != "Unknown" else [])
+        X = np.column_stack(cols_x)
+        ok = np.isfinite(y) & np.isfinite(X).all(1)
+        if ok.sum() < min_obs or not ok[form].all():
+            continue
+        beta = np.linalg.lstsq(X[ok], y[ok], rcond=None)[0]
+        e = (y - X @ beta)[form]
+        sd = e.std(ddof=1)
+        out[i] = e.sum() / sd if sd > 0 else np.nan
+    return out
+
+
 def trailing_vol(m: Market, s: int, cols, days: int = 252) -> np.ndarray:
     px = m.close_ff[max(0, s - days) : s + 1][:, cols]
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -226,6 +278,12 @@ def rank_universe(cfg: Config, m: Market, s: int, month: pd.Period) -> pd.DataFr
         score[:] = np.nan
         score[ok] = (pr(mom[ok]) + pr(mom6[ok])) / 2
         idx = ok
+    elif cfg.score in ("residual", "residual_sector") and len(idx):
+        # momentum net of market (and sector) moves: avoids buying a basket that is just one hot
+        # sector or the highest-beta names
+        score[idx] = residual_momentum(m, month, idx, cfg.lookback_months, cfg.skip_months,
+                                       _sector_codes() if cfg.score == "residual_sector" else None)
+        idx = idx[np.isfinite(score[idx])]
     elif cfg.score == "high52" and len(idx):
         # George & Hwang (2004): closeness to the 52-week high, ties broken by 12-1 momentum
         hi = np.nanmax(m.close_ff[max(0, s - 251) : s + 1][:, idx], axis=0)
@@ -442,6 +500,7 @@ def run(cfg: Config) -> Result:
                     slots -= 1
                 final = list(shares) + new
                 nav_now = cash + sum(q * px_open(t, j) for j, q in shares.items())
+                cap = cfg.max_weight * nav_now if cfg.max_weight > 0 else np.inf
                 exposure = exposure_cap
                 if cfg.vol_target > 0 and final:
                     w = trailing_vol_basket(m, s_, final)
@@ -454,19 +513,18 @@ def run(cfg: Config) -> Result:
                         w = iv / iv.sum() * len(final) / cfg.top_n
                     else:
                         w = np.full(len(final), 1 / cfg.top_n)
-                    targets = {j: exposure * nav_now * wj for j, wj in zip(final, w)}
+                    targets = {j: min(exposure * nav_now * wj, cap) for j, wj in zip(final, w)}
                     traded += rebalance_to(t, targets, nav_now, rank_of)
                     n_bought = len(new)
                 else:
                     if cfg.max_weight > 0:
-                        cap = cfg.max_weight * nav_now
                         for j in list(shares):
                             p = px_open(t, j)
                             excess = shares[j] * p - cap
                             if excess > 0:
                                 traded += trim(t, j, excess, p, f"above {cfg.max_weight:.0%} cap")
-                    # new names get sale proceeds, up to an equal 1/N weight each
-                    per = nav_now / cfg.top_n
+                    # new names get sale proceeds, up to an equal 1/N weight each (never above the cap)
+                    per = min(nav_now / cfg.top_n, cap)
                     alloc = min(cash / len(new), per) if new else 0
                     for j in new:
                         buy(t, j, alloc, m.open[t, j], f"rank {rank_of[j]}")
@@ -533,6 +591,7 @@ def run(cfg: Config) -> Result:
                              weight=q * px / nav[t_last], entry=dates[entry_t.get(j, t_last)],
                              cost=cost_in.get(j, np.nan), gain=q * px / cost_in[j] - 1 if cost_in.get(j) else np.nan))
     positions = pd.DataFrame(pos_rows, columns=["ticker", "shares", "price", "value", "weight", "entry", "cost", "gain"])
+    positions["entry"] = pd.to_datetime(positions["entry"])  # keeps a datetime dtype when all in cash
 
     sl = slice(start, end)
     nav_s = pd.Series(nav[sl], index=dates[sl], name=cfg.label)

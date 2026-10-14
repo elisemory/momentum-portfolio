@@ -69,7 +69,8 @@ def monthly_table(nav: pd.Series) -> pd.DataFrame:
     ret.iloc[0] = m.iloc[0] / nav.iloc[0] - 1
     t = pd.DataFrame({"y": ret.index.year, "m": ret.index.month, "r": ret.values})
     tab = t.pivot(index="y", columns="m", values="r")
-    tab.columns = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][: len(tab.columns)]
+    names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    tab.columns = [names[c - 1] for c in tab.columns]  # only the months present, correctly labelled
     tab["Year"] = (1 + tab.fillna(0)).prod(axis=1) - 1
     return tab
 

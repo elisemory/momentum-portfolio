@@ -110,10 +110,17 @@ with c2:
     if st.button("⟳ Update now", type="primary", width="stretch",
                  help="Download the latest prices and index changes, then recompute."):
         with st.status("Updating data…", expanded=True) as status:
-            run_refresh(st.write)
-            status.update(label="Updated", state="complete")
-        st.cache_data.clear()
-        st.rerun()
+            try:
+                run_refresh(st.write)
+                status.update(label="Updated", state="complete")
+                ok = True
+            except Exception as e:  # e.g. Yahoo returned no or stale prices: keep the cached data
+                st.write(f"Update failed: {e}")
+                status.update(label="Update failed; showing the cached data", state="error")
+                ok = False
+        if ok:
+            st.cache_data.clear()
+            st.rerun()
 
 
 @st.fragment(run_every="10m")  # pick up scheduler refreshes without a manual reload
@@ -186,6 +193,10 @@ def holdings_section() -> None:
     p = load_portfolio(data_version())
     pos = p["positions"].copy()
     st.subheader("Current holdings")
+    if pos.empty:
+        st.info(f"**All cash.** The portfolio holds no stocks (100% in T-bills) since the "
+                f"{p['last_rebalance']:%b %d, %Y} rebalance.")
+        return
     try:
         q, q_day = load_quotes(tuple(pos["ticker"]) + ("^GSPC", "^NDX"))
     except Exception as e:  # network hiccup: show the table without live prices
@@ -282,12 +293,15 @@ def track_record() -> None:
     with st.expander("Before you trade: what the research found"):
         st.markdown("""
 - **Taxes matter a lot.** About two-thirds of gains are short-term. At a 30% rate the backtested CAGR falls from
-  ~17.7% to ~13.6%, and since 2011 it roughly ties buy-and-hold SPY after tax. Use a tax-advantaged account.
-- **Since 2011 the Nasdaq-100 did better** (about 19% vs 17% a year) with less volatility. The strategy's edge over
+  ~18% to ~14%, and since 2011 it roughly ties or trails buy-and-hold SPY after tax. Use a tax-advantaged account.
+- **Since 2011 the Nasdaq-100 did better** (about 19% vs 16% a year) with less volatility. The strategy's edge over
   the full period comes mostly from avoiding the 2000–02 and 2008 crashes.
-- **One-month crashes can't be avoided** by a monthly rule. COVID took the portfolio down 36% in 2020.
-- **It's a backtest.** About 40 variants were tested before choosing these rules, so expect live results to be
-  lower. Full details are in `FINDINGS.md` and the research app (`./run.sh`).
+- **One-month crashes can't be avoided** by a monthly rule. COVID took the portfolio down 39% in 2020.
+- **The basket can crash on its own.** It often concentrates in one theme. In June–July 2026 it fell 33% while the
+  S&P 500 fell 2%, when the chip and memory stocks it held reversed together.
+- **It's a backtest.** About 45 variants were tested before choosing these rules, so expect live results to be
+  lower. Free price data also lacks most companies that failed before 2010, which flatters the early years. Full
+  details are in `FINDINGS.md` and the research app (`./run.sh`).
 - This is research output, not investment advice.
 """)
 

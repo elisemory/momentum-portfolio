@@ -4,6 +4,7 @@ Everything is cached under data/ so the app and backtests run offline after the 
 """
 from __future__ import annotations
 
+import io
 import time
 from pathlib import Path
 
@@ -36,8 +37,24 @@ def bad_tickers(close: pd.DataFrame, max_extreme_days: int = 3) -> set[str]:
     return BLOCKLIST | set(ext[ext >= max_extreme_days].index)
 
 
+# Members listed under a symbol that later changed. Yahoo keeps the company's whole history under
+# the current symbol only, so without this the member has no prices for its years under the old one
+# (e.g. Facebook as FB, 2013-22). Each pair was checked: the new symbol's history covers the old
+# membership span, Yahoo names the same company, and the two symbols never denote two different
+# members at once. Ambiguous reuse, such as the old Ingersoll-Rand (IR, now TT) while today's IR is
+# another member, can't be fixed by a plain old -> new map and is left out.
+RENAMES = {
+    "FB": "META", "ANTM": "ELV", "WLTW": "WTW", "BLL": "BALL", "SYMC": "GEN", "NLOK": "GEN",
+    "PKI": "RVTY", "RE": "EG", "ABC": "COR", "HCP": "DOC", "PEAK": "DOC", "FLT": "CPAY", "HRS": "LHX",
+    "TMK": "GL", "BHGE": "BKR", "JEC": "J", "UTX": "RTX", "CTL": "LUMN", "MYL": "VTRS", "LB": "BBWI",
+    "GPS": "GAP", "FBHS": "FBIN", "ADS": "BFH", "BK": "BNY", "MMC": "MRSH", "FI": "FISV", "DWDP": "DD",
+    "KORS": "CPRI", "ARNC": "HWM", "PX": "LIN", "PSKY": "SKYD", "SATS": "ECHO",
+}
+
+
 def yahoo_symbol(t: str) -> str:
-    return t.replace(".", "-")
+    t = t.replace(".", "-")
+    return RENAMES.get(t, t)
 
 
 # ---------------------------------------------------------------- membership
@@ -46,7 +63,14 @@ def fetch_membership() -> Path:
     out = DATA_DIR / "sp500_hist.csv"
     r = requests.get(MEMBERSHIP_URL, timeout=60)
     r.raise_for_status()
-    out.write_bytes(r.content)
+    hist = pd.read_csv(io.BytesIO(r.content), dtype=str)
+    if out.exists():
+        # keep snapshots recorded locally (live.refresh_membership) after the upstream file's last
+        # date: upstream often lags by months, and dropping them would rewrite past membership
+        local = pd.read_csv(out, dtype=str)
+        newer = local[local["date"] > hist["date"].max()]
+        hist = pd.concat([hist, newer], ignore_index=True)
+    hist.sort_values("date").to_csv(out, index=False)
     return out
 
 
@@ -116,9 +140,18 @@ def fetch_prices(tickers: list[str] | None = None, chunk: int = 80, log=print) -
     log(f"saved prices for {c.shape[1]} symbols, {c.index[0].date()} .. {c.index[-1].date()}")
 
 
-def load_prices() -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_prices(supplement: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Yahoo prices, plus (by default) the supplement: adjusted prices from the frozen Quandl WIKI
+    archive for former members Yahoo no longer has (see momentum.supplement). The supplement is
+    kept in its own files so refreshes never write it into the Yahoo files or the published bundle."""
     o = pd.read_parquet(DATA_DIR / "open.parquet")
     c = pd.read_parquet(DATA_DIR / "close.parquet")
+    so, sc = DATA_DIR / "supplement_open.parquet", DATA_DIR / "supplement_close.parquet"
+    if supplement and sc.exists():
+        s_o, s_c = pd.read_parquet(so), pd.read_parquet(sc)
+        new = [t for t in s_c.columns if t not in c.columns]
+        o = o.join(s_o[new].reindex(o.index))
+        c = c.join(s_c[new].reindex(c.index))
     return o, c
 
 
@@ -199,7 +232,7 @@ def fetch_sectors(tickers: list[str] | None = None, log=print) -> None:
     import yfinance as yf
 
     if tickers is None:
-        _, c = load_prices()
+        _, c = load_prices(supplement=False)
         tickers = [t for t in c.columns if t not in EXTRA]
     rows = []
     for n, t in enumerate(tickers, 1):

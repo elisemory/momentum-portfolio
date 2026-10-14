@@ -121,11 +121,31 @@ def _download(tickers: list[str], start: str, log=print, chunk: int = 80) -> tup
     return o.loc[:, ~o.columns.duplicated()], c.loc[:, ~c.columns.duplicated()]
 
 
+def _check_download(c_new: pd.DataFrame, members: list[str], min_coverage: float = 0.9,
+                    max_lag_days: int = 3, now: datetime | None = None) -> None:
+    """Raise unless the download reaches the latest completed session for the index and most current
+    members. Yahoo failures come back as empty or partial frames rather than errors, and merging
+    those into the cache would leave old prices looking freshly refreshed."""
+    if data.INDEX not in c_new.columns or c_new[data.INDEX].last_valid_index() is None:
+        raise RuntimeError("price download failed: no data for the S&P 500 index")
+    last = c_new[data.INDEX].last_valid_index()
+    # most recent completed session (federal holidays approximate NYSE), with slack for Yahoo lag
+    # and exchange-only holidays such as Good Friday
+    bday = CustomBusinessDay(calendar=USFederalHolidayCalendar())
+    expected = pd.Timestamp((now or datetime.now()).date()) - bday
+    if last < expected - max_lag_days * bday:
+        raise RuntimeError(f"price download is stale: index data ends {last.date()}, expected ~{expected.date()}")
+    have = c_new.reindex(columns=members).loc[last - 5 * bday:].notna().any()
+    if have.mean() < min_coverage:
+        raise RuntimeError(f"price download incomplete: recent prices for only {int(have.sum())} of "
+                           f"{len(members)} current members")
+
+
 def update_prices(log=print, overlap_days: int = 120) -> None:
     """Download only recent bars and merge them in. Yahoo's adjusted history is rescaled after
     every dividend or split, so each stock's older history is rescaled by the median ratio of
     new/old prices on the overlapping days before merging."""
-    o_old, c_old = data.load_prices()
+    o_old, c_old = data.load_prices(supplement=False)  # never write the supplement into Yahoo files
     recent_cut = c_old.index[-1] - pd.Timedelta(days=40)
     active = [t for t in c_old.columns if c_old[t].loc[recent_cut:].notna().any()]
     members = set().union(*data.load_membership()["tickers"].iloc[-3:])
@@ -134,6 +154,7 @@ def update_prices(log=print, overlap_days: int = 120) -> None:
     start = (c_old.index[-1] - pd.Timedelta(days=overlap_days)).strftime("%Y-%m-%d")
     log(f"updating {len(active)} active symbols since {start}")
     o_new, c_new = _download(sorted(set(active) | set(data.EXTRA)), start, log)
+    _check_download(c_new, [t for t in data.load_membership()["tickers"].iloc[-1] if t in c_old.columns])
     if new_names:
         log(f"full history for new members: {', '.join(new_names)}")
         o_full, c_full = _download(new_names, data.PRICE_START, log)
@@ -167,7 +188,7 @@ def refresh(log=print) -> None:
     except Exception as e:
         log(f"benchmark refresh failed ({e})")
     sectors = data.load_sectors()
-    _, c = data.load_prices()
+    _, c = data.load_prices(supplement=False)
     missing = [t for t in c.columns if t not in sectors and t not in data.EXTRA]
     if missing:
         log(f"sectors for {len(missing)} new symbols")
@@ -176,8 +197,7 @@ def refresh(log=print) -> None:
         data.fetch_sectors(missing, log=lambda *_: None)
         new = pd.read_csv(path)
         pd.concat([old, new]).drop_duplicates("ticker", keep="last").to_csv(path, index=False)
-    for f in (bt.load_market, bt._membership, bt._quality, bt._regime_inputs, bt._sector_codes):
-        f.cache_clear()
+    bt.clear_caches()
     STATE_FILE.write_text(json.dumps({"last_refresh": datetime.now().isoformat(timespec="seconds")}))
     log("refresh complete")
 
@@ -307,8 +327,7 @@ def download_data(log=print, url: str = DATA_URL) -> bool:
                     src = tar.extractfile(member)
                     (data.DATA_DIR / member.name).write_bytes(src.read())
         Path(tmp.name).unlink(missing_ok=True)
-        for f in (bt.load_market, bt._membership, bt._quality, bt._regime_inputs, bt._sector_codes):
-            f.cache_clear()
+        bt.clear_caches()
         log("downloaded published data bundle")
         return True
     except Exception as e:

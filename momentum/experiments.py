@@ -60,6 +60,8 @@ IMPROVED_VARIANTS: dict[str, dict] = {
     "Regime: slope over 63 days": dict(slope_days=63),
     "Score: 12-1 only": dict(score="raw"),
     "Score: return / volatility": dict(score="risk_adjusted"),
+    "Score: residual momentum (market)": dict(score="residual"),
+    "Score: residual momentum (market + sector)": dict(score="residual_sector"),
     "No 10% position cap": dict(max_weight=0.0),
     "No rank-40 buffer": dict(buffer_rank=20),
     "Basket: 15 names / buffer 30": dict(top_n=15, buffer_rank=30),
