@@ -140,10 +140,10 @@ def main() -> None:
     k[2].metric("Next rebalance", f"{p['next_rebalance']:%a %b %d}",
                 "trades are final" if p["final"] else "preview, final after month-end", delta_color="off", delta_arrow="off")
     k[3].metric("Holdings", f"{len(p['positions'])}", f"cash {p['cash_weight']:.1%}", delta_color="off", delta_arrow="off")
-    ytd = p["nav"][p["nav"].index.year == p["as_of"].year]
-    ytd_b = p["bench"][p["bench"].index.year == p["as_of"].year]
-    k[4].metric("Year to date", f"{ytd.iloc[-1] / ytd.iloc[0] - 1:+.1%}",
-                f"S&P {ytd_b.iloc[-1] / ytd_b.iloc[0] - 1:+.1%}", delta_color="off", delta_arrow="off")
+    y0 = period_start(p["nav"].index, "YTD")  # last close of the previous year
+    ytd = lambda s: s.iloc[-1] / s[y0] - 1  # noqa: E731
+    k[4].metric("Year to date", f"{ytd(p['nav']):+.1%}", f"S&P {ytd(p['bench']):+.1%}",
+                delta_color="off", delta_arrow="off")
 
     # ---- next rebalance
     st.subheader(f"Next rebalance · {p['next_rebalance']:%A %B %d, %Y} at the open")
@@ -255,6 +255,87 @@ def holdings_section() -> None:
             st.caption(f"⚠ {sec.max():.0%} in {top}: momentum baskets concentrate in leading sectors.")
 
 
+def shade_bear(fig, rb: pd.DataFrame, x0: pd.Timestamp, x1: pd.Timestamp) -> None:
+    """Gray bands where the strategy sat in T-bills, clipped to [x0, x1]."""
+    bear = rb["regime"].eq("bear")
+    for s0 in rb.index[bear & ~bear.shift(1, fill_value=False)]:
+        after = rb.index[(rb.index > s0) & ~bear]
+        s1 = after[0] if len(after) else x1
+        if s1 > x0 and s0 < x1:
+            fig.add_vrect(x0=max(s0, x0), x1=min(s1, x1), fillcolor="rgba(137,135,129,0.14)",
+                          line_width=0, layer="below")
+
+
+PERIODS = {"1D": None, "5D": None, "1M": 1, "3M": 3, "6M": 6, "YTD": None, "1Y": 12, "3Y": 36, "5Y": 60,
+           "10Y": 120, "Max": None}
+
+
+def period_start(idx: pd.DatetimeIndex, period: str) -> pd.Timestamp:
+    """Base close for a trailing period ending at idx[-1] (Yahoo-style: 5D = five sessions back)."""
+    end = idx[-1]
+    if period in ("1D", "5D"):
+        return idx[max(-len(idx), -1 - int(period[0]))]
+    if period == "Max":
+        return idx[0]
+    target = pd.Timestamp(end.year, 1, 1) - pd.Timedelta(days=1) if period == "YTD" \
+        else end - pd.DateOffset(months=PERIODS[period])
+    before = idx[idx <= target]
+    return before[-1] if len(before) else idx[0]
+
+
+@st.fragment(run_every="10m")
+def performance_section() -> None:
+    p = load_portfolio(data_version())
+    nav = p["nav"]
+    ndx = data.load_nasdaq().reindex(nav.index, method="ffill")
+    lines = {"Momentum portfolio": (nav, SERIES[0]), "S&P 500": (p["bench"], SERIES[1]),
+             "Nasdaq-100": (ndx, SERIES[2])}
+    idx, end = nav.index, nav.index[-1]
+    st.subheader("Performance")
+
+    # ---- every trailing period at a glance
+    ret = lambda s, t0, t1: s[t1] / s[t0] - 1 if pd.notna(s[t0]) else np.nan  # noqa: E731
+    grid = pd.DataFrame({per: {name: ret(s, period_start(idx, per), end) for name, (s, _) in lines.items()}
+                         for per in PERIODS})
+    st.dataframe(grid.style.format("{:+,.1%}", na_rep="—").map(color_change), width="stretch")
+
+    # ---- chart for one period or a custom date range
+    c1, c2 = st.columns([3, 2], vertical_alignment="bottom")
+    choice = c1.segmented_control("Period", list(PERIODS) + ["Custom"], default="1Y", key="perf_period",
+                                  label_visibility="collapsed") or "1Y"
+    if choice == "Custom":
+        picked = c2.date_input("Date range", value=((end - pd.DateOffset(years=1)).date(), end.date()),
+                               min_value=idx[0].date(), max_value=end.date(), key="perf_range",
+                               format="YYYY-MM-DD", label_visibility="collapsed")
+        if len(picked) < 2:
+            st.caption("Pick an end date.")
+            return
+        on_or_before = lambda d: idx[idx <= pd.Timestamp(d)]  # noqa: E731
+        t0 = on_or_before(picked[0])[-1] if len(on_or_before(picked[0])) else idx[0]
+        t1 = on_or_before(picked[1])[-1]
+        if t1 <= t0:
+            st.caption("Pick a range that spans at least two trading days.")
+            return
+    else:
+        t0, t1 = period_start(idx, choice), end
+
+    fig = go.Figure()
+    for name, (s, color) in lines.items():
+        w = s[t0:t1]
+        if w.isna().iloc[0]:
+            continue
+        r = w / w.iloc[0] - 1
+        fig.add_scatter(x=r.index, y=r, name=f"{name} {r.iloc[-1]:+.1%}", line=dict(color=color, width=2),
+                        mode="lines+markers" if len(r) <= 25 else "lines", hovertemplate=f"{name}: %{{y:+.2%}}<extra></extra>")
+    shade_bear(fig, p["rebalances"], t0, t1)
+    fig.add_hline(y=0, line_color=AXIS, line_width=1)
+    fig.update_layout(title=dict(text=f"Return from {t0:%b %d, %Y} close to {t1:%b %d, %Y} · gray = in T-bills"))
+    st.plotly_chart(style(fig, 400, yfmt="+.0%"), width="stretch", key="perf_chart")
+    st.caption(f"Total returns through the {end:%b %d} close: the portfolio is the strategy's simulated "
+               "daily value (it trades only at monthly rebalances), the S&P 500 is SPY and the Nasdaq-100 is "
+               "QQQ, both with dividends reinvested. Periods are trailing from the last close, like Yahoo Finance.")
+
+
 @st.fragment(run_every="10m")
 def track_record() -> None:
     p = load_portfolio(data_version())
@@ -281,12 +362,7 @@ def track_record() -> None:
                     hovertemplate="$%{y:,.0f}")
     fig.add_scatter(x=nav.index, y=nav, name="Momentum portfolio", line=dict(color=SERIES[0], width=2),
                     hovertemplate="$%{y:,.0f}")
-    rb = p["rebalances"]
-    bear = rb["regime"].eq("bear")
-    for s0 in rb.index[bear & ~bear.shift(1, fill_value=False)]:
-        after = rb.index[(rb.index > s0) & ~bear]
-        fig.add_vrect(x0=s0, x1=after[0] if len(after) else nav.index[-1], fillcolor="rgba(137,135,129,0.14)",
-                      line_width=0, layer="below")
+    shade_bear(fig, p["rebalances"], nav.index[0], nav.index[-1])
     fig.update_layout(title=dict(text="Growth of $100,000 since 1996 (log scale) · gray = in T-bills"))
     st.plotly_chart(style(fig, 420, log=True), width="stretch")
 
@@ -308,4 +384,5 @@ def track_record() -> None:
 
 main()
 holdings_section()
+performance_section()
 track_record()
