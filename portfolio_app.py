@@ -21,6 +21,7 @@ from momentum import data, live
 from momentum import metrics as mt
 
 st.set_page_config(page_title="Momentum Portfolio", layout="wide")
+CFG = live.LIVE_CONFIG
 
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a"]
 INK, INK2, MUTED, GRID, AXIS = "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7"
@@ -102,7 +103,8 @@ def load_portfolio(version: tuple) -> dict:
 c1, c2 = st.columns([5, 1])
 with c1:
     st.title("Momentum Portfolio")
-    st.caption("Top 20 S&P 500 stocks by blended 12-1 / 6-1 momentum · hold while rank ≤ 40 · max 10% per stock · "
+    st.caption(f"Top {CFG.top_n} S&P 500 stocks by blended 12-1 / 6-1 momentum · "
+               f"hold while rank ≤ {max(CFG.buffer_rank, CFG.top_n)} · max {CFG.max_weight:.0%} per stock · "
                "T-bills when the S&P 500 is below a falling 200-day average · rebalance on the first trading day "
                "of each month")
 with c2:
@@ -225,7 +227,7 @@ def holdings_section() -> None:
         "Rank now": pos["rank"], "12-1 momentum": pos["momentum"], "6-1 momentum": pos["momentum_6_1"],
         "Held since": pos["entry"].dt.date, "Return since bought": pos["gain"],
         "Status": np.where(pos["ticker"].isin([t for t, _ in p["sells"]]), "sell next rebalance",
-                           np.where(pos["rank"] <= 20, "top 20", "held by buffer")),
+                           np.where(pos["rank"] <= CFG.top_n, f"top {CFG.top_n}", "held by buffer")),
     })
     if q is None:
         tab = tab.drop(columns=["Price", "Today"])
