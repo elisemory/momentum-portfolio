@@ -96,10 +96,12 @@ with st.sidebar:
     # month pickers instead of calendars: any month from Feb 1996 up to last month, type to search
     last_full = m.dates[-1].to_period("M") - 1
     months = [str(x) for x in pd.period_range("1996-02", last_full, freq="M")]
-    start_m = c1.selectbox("Start", months, index=0, key=K("start"),
+    # default to Jan 2010: earlier years miss many delisted members (see FINDINGS.md section 8)
+    start_m = c1.selectbox("Start", months, index=months.index("2010-01"), key=K("start"),
                            format_func=lambda x: pd.Period(x).strftime("%b %Y"),
                            help="The backtest starts on the first trading day of this month. Type to search, "
-                                "e.g. '2025'.")
+                                "e.g. '2025'. Defaults to Jan 2010: before about 2010 the price data misses "
+                                "many companies that left the index, especially ones that failed.")
     ends = ["latest"] + [str(x) for x in pd.period_range(start_m, last_full, freq="M")][::-1]
     end_m = c2.selectbox("End", ends, index=0, key=K("end"),
                          format_func=lambda x: f"Latest ({m.dates[-1]:%b %d})" if x == "latest"
