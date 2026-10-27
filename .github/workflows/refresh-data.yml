@@ -2,7 +2,7 @@ name: Refresh data
 
 on:
   schedule:
-    - cron: "0 10 1 * *"  # 1st of each month, 10:00 UTC (06:00 New York)
+    - cron: "30 21 * * 1-5"  # weekdays after the US close (including standard time)
   workflow_dispatch:
 
 permissions:

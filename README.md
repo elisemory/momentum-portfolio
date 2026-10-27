@@ -20,14 +20,14 @@ This app has no strategy controls. It always runs the Improved strategy (`moment
 
 **Data refresh:**
 
-- **Automatic:** on the 1st of each month at 06:00 local time, run by a background thread in the app. The thread checks every 15 minutes. If the app wasn't running on the 1st, it refreshes when it next starts.
+- **Automatic:** weekday catch-up at 06:00 New York time, then every 15 minutes from 09:30 through 16:15. A background thread checks every 15 minutes and catches up after downtime. Trading rules still rebalance monthly. The performance table and chart use the latest available daily bar (which may be intraday and delayed), with SPY/QQQ total returns explicitly labeled; missing benchmark observations remain unavailable rather than appearing flat.
 - **Manual:** the **Update now** button.
 - **What a refresh downloads:** S&P 500 membership changes from Wikipedia, about 4 months of recent prices (older history is rescaled for dividends and splits), full history for new index members, and benchmark data.
 
 The background thread only runs while the app is running. To refresh without the app, use cron:
 
 ```cron
-0 6 1 * *  cd ~/projects/momentum-backtest && .venv/bin/python -m momentum.live --if-due
+*/15 * * * *  cd ~/projects/momentum-backtest && .venv/bin/python -m momentum.live --if-due
 ```
 
 The `data/` folder is already filled. To re-download data, click **Download / refresh data** in the sidebar.
@@ -41,7 +41,7 @@ The `data/` folder is already filled. To re-download data, click **Download / re
 | `momentum/sector_etf.py` | Runs the same rules on the SPDR sector ETFs, for comparison. Run `python -m momentum.sector_etf --fetch` |
 | `momentum/backtest.py` | Engine. `Config` holds every parameter. `run(cfg)` returns NAV, holdings, and trades. `live_signal(cfg)` returns today's ranking |
 | `momentum/metrics.py` | CAGR, Sharpe, Sortino, drawdowns, calendar tables, and turnover |
-| `momentum/live.py` | Data refresh, monthly schedule, current portfolio, and next-rebalance trades |
+| `momentum/live.py` | Data refresh, market-day schedule, current portfolio, and next-rebalance trades |
 | `momentum/taxes.py` | After-tax comparison against buy-and-hold SPY. Run `python -m momentum.taxes` |
 | `FINDINGS.md` | All research findings. Also shown in the research app's Findings tab |
 | `momentum/experiments.py` | Robustness harness. Scores every idea on 1996–2010 and 2011–now separately. Run `python -m momentum.experiments` |
@@ -131,8 +131,8 @@ Pre-2010 failures (Lehman, Enron and others) are still missing; see FINDINGS.md 
 
 The live app runs `portfolio_app.py` from this repo on [Streamlit Community Cloud](https://share.streamlit.io).
 
-- **Data isn't committed to git.** The `.github/workflows/refresh-data.yml` Action refreshes it on the 1st of each month at 10:00 UTC. It publishes the result as `momentum-data.tar.gz` on the `data-latest` release, replacing the previous file, so the repo doesn't grow. To refresh by hand, go to **Actions → Refresh data → Run workflow**.
-- **The hosted app downloads that file** whenever it starts with an empty disk. While it's awake, it also refreshes itself on the 1st. If Yahoo blocks the request, it falls back to the published file.
+- **Data isn't committed to git.** The `.github/workflows/refresh-data.yml` Action refreshes it every weekday at 21:30 UTC, after the US close. It publishes the result as `momentum-data.tar.gz` on the `data-latest` release, replacing the previous file, so the repo doesn't grow. To refresh by hand, go to **Actions → Refresh data → Run workflow**.
+- **The hosted app downloads that file** whenever it starts with an empty disk. While it's awake, it also refreshes itself throughout the US session. If Yahoo blocks the request, it falls back to the published file.
 - **To deploy:** at share.streamlit.io, choose **Create app**, then:
   - Repository: `elisemory/momentum-portfolio`
   - Branch: `main`

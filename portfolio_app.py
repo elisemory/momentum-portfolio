@@ -1,8 +1,8 @@
 """Momentum portfolio: current holdings and next trades for the Improved 12-1 strategy.
 
 No strategy controls: the rules are fixed to the research winner (see FINDINGS.md).
-Data refreshes automatically on the 1st of each month at 06:00 (and catches up on start-up if a
-refresh was missed); the Update button refreshes on demand.
+Prices refresh every 15 minutes during the US session, plus a weekday premarket catch-up.
+Trading rules still rebalance monthly; the Update button refreshes prices on demand.
 
 Run:  ./run_portfolio.sh      (http://localhost:8502)
 """
@@ -19,6 +19,7 @@ import streamlit as st
 
 from momentum import data, live
 from momentum import metrics as mt
+from momentum.performance import PERIODS, period_start, trailing_returns
 
 st.set_page_config(page_title="Momentum Portfolio", layout="wide")
 CFG = live.LIVE_CONFIG
@@ -45,8 +46,14 @@ def style(fig, height=380, yfmt=None, log=False):
     return fig
 
 
-# ---------------------------------------------------------------- monthly auto-refresh
-_lock = threading.Lock()
+# ---------------------------------------------------------------- price auto-refresh
+@st.cache_resource
+def refresh_lock():
+    """Share the lock across reruns and browser sessions, like the scheduler itself."""
+    return threading.Lock()
+
+
+_lock = refresh_lock()
 
 
 def run_refresh(log=print) -> None:
@@ -56,7 +63,7 @@ def run_refresh(log=print) -> None:
 
 @st.cache_resource
 def start_scheduler() -> threading.Thread:
-    """One background thread per server: every 15 minutes, refresh if the 1st-of-month run is due."""
+    """One background thread per server: check for a due price refresh every 15 minutes."""
     def loop():
         while True:
             try:
@@ -65,11 +72,12 @@ def start_scheduler() -> threading.Thread:
                         run_refresh(lambda *_: None)
                     except Exception as e:  # e.g. Yahoo blocking a cloud IP: use the published bundle
                         print(f"[scheduler] refresh failed ({e}); trying the published data bundle")
-                        live.download_data(print)
+                        with _lock:
+                            live.download_data(print)
             except Exception as e:  # keep the scheduler alive; next check retries
                 print(f"[scheduler] refresh failed: {e}")
             time.sleep(15 * 60)
-    th = threading.Thread(target=loop, name="monthly-refresh", daemon=True)
+    th = threading.Thread(target=loop, name="price-refresh", daemon=True)
     th.start()
     return th
 
@@ -86,13 +94,21 @@ start_scheduler()  # only once data exists, so it never races the first-run down
 
 
 def data_version() -> tuple:
-    files = [data.DATA_DIR / f for f in ("close.parquet", "sp500_hist.csv", "live_state.json")]
+    files = [data.DATA_DIR / f for f in ("open.parquet", "close.parquet", "nasdaq100_tr.parquet",
+                                        "sp500_hist.csv", "live_state.json")]
     return tuple(f.stat().st_mtime if f.exists() else 0 for f in files)
 
 
 @st.cache_data(show_spinner="Computing portfolio…", max_entries=2)
 def load_portfolio(version: tuple) -> dict:
-    p = live.portfolio()
+    with _lock:
+        # File changes also come from other apps, or a refresh that fails after writing prices.
+        live.bt.clear_caches()
+        p = live.portfolio()
+        p["nasdaq"] = data.load_nasdaq()
+        # The simulator fills missing prices for valuation; benchmark performance must not.
+        p["performance_bench"] = pd.read_parquet(data.DATA_DIR / "close.parquet",
+                                                 columns=[data.BENCH])[data.BENCH]
     r = p.pop("result")
     p["nav"], p["bench"], p["rf"] = r.nav, r.bench, r.cash_rate
     p["rebalances"] = r.rebalances
@@ -128,11 +144,11 @@ with c2:
 @st.fragment(run_every="10m")  # pick up scheduler refreshes without a manual reload
 def main() -> None:
     p = load_portfolio(data_version())
-    now = datetime.now()
+    now = datetime.now(live.MARKET_TZ)
     last = live.last_refresh()
     st.caption(f"Prices as of **{p['as_of']:%a %b %d, %Y}** · last update "
                f"{(last.strftime('%b %d %H:%M') if last else 'never')} · next automatic update "
-               f"**{live.next_scheduled(now):%a %b %d, %H:%M}**")
+               f"**{live.next_scheduled(now):%a %b %d, %H:%M} ET**")
 
     # ---- status tiles
     k = st.columns(5)
@@ -151,7 +167,7 @@ def main() -> None:
     st.subheader(f"Next rebalance · {p['next_rebalance']:%A %B %d, %Y} at the open")
     if not p["final"]:
         st.caption("Preview based on the latest close. The final list is fixed by the last close of the month and "
-                   "refreshes automatically on the 1st.")
+                   "is available after the month-end price refresh.")
     if not p["bull"]:
         st.error("**▼ Bear regime:** sell all stocks and hold T-bills (e.g. SGOV, BIL) until the regime turns bull.")
     c1, c2, c3 = st.columns(3)
@@ -268,38 +284,27 @@ def shade_bear(fig, rb: pd.DataFrame, x0: pd.Timestamp, x1: pd.Timestamp) -> Non
                           line_width=0, layer="below")
 
 
-PERIODS = {"1D": None, "5D": None, "1M": 1, "3M": 3, "6M": 6, "YTD": None, "1Y": 12, "3Y": 36, "5Y": 60,
-           "10Y": 120, "Max": None}
-
-
-def period_start(idx: pd.DatetimeIndex, period: str) -> pd.Timestamp:
-    """Base close for a trailing period ending at idx[-1] (Yahoo-style: 5D = five sessions back)."""
-    end = idx[-1]
-    if period in ("1D", "5D"):
-        return idx[max(-len(idx), -1 - int(period[0]))]
-    if period == "Max":
-        return idx[0]
-    target = pd.Timestamp(end.year, 1, 1) - pd.Timedelta(days=1) if period == "YTD" \
-        else end - pd.DateOffset(months=PERIODS[period])
-    before = idx[idx <= target]
-    return before[-1] if len(before) else idx[0]
-
-
-@st.fragment(run_every="10m")
+@st.fragment(run_every="1m")
 def performance_section() -> None:
     p = load_portfolio(data_version())
     nav = p["nav"]
-    ndx = data.load_nasdaq().reindex(nav.index, method="ffill")
-    lines = {"Momentum portfolio": (nav, SERIES[0]), "S&P 500": (p["bench"], SERIES[1]),
-             "Nasdaq-100": (ndx, SERIES[2])}
+    ndx = p["nasdaq"].reindex(nav.index)
+    lines = {"Momentum portfolio": (nav, SERIES[0]),
+             "S&P 500 (SPY)": (p["performance_bench"].reindex(nav.index), SERIES[1]),
+             "Nasdaq-100 (QQQ)": (ndx, SERIES[2])}
     idx, end = nav.index, nav.index[-1]
     st.subheader("Performance")
+    missing = [name for name, (s, _) in lines.items() if pd.isna(s.loc[end])]
+    if missing:
+        st.warning(f"Latest prices unavailable for {', '.join(missing)}. Returns are shown as — until "
+                   "the next successful refresh.")
+    if end.date() < datetime.now(live.MARKET_TZ).date() and live.market_open():
+        st.info(f"History currently ends {end:%b %d}. Today's prices will appear after the ongoing "
+                "or next automatic refresh; Update now also refreshes them.")
 
     # ---- every trailing period at a glance
-    ret = lambda s, t0, t1: s[t1] / s[t0] - 1 if pd.notna(s[t0]) else np.nan  # noqa: E731
-    grid = pd.DataFrame({per: {name: ret(s, period_start(idx, per), end) for name, (s, _) in lines.items()}
-                         for per in PERIODS})
-    st.dataframe(grid.style.format("{:+,.1%}", na_rep="—").map(color_change), width="stretch")
+    grid = trailing_returns(pd.DataFrame({name: s for name, (s, _) in lines.items()}))
+    st.dataframe(grid.style.format("{:+,.2%}", na_rep="—").map(color_change), width="stretch")
 
     # ---- chart for one period or a custom date range
     c1, c2 = st.columns([3, 2], vertical_alignment="bottom")
@@ -324,18 +329,22 @@ def performance_section() -> None:
     fig = go.Figure()
     for name, (s, color) in lines.items():
         w = s[t0:t1]
-        if w.isna().iloc[0]:
+        if pd.isna(w.iloc[0]) or pd.isna(w.iloc[-1]):
             continue
         r = w / w.iloc[0] - 1
-        fig.add_scatter(x=r.index, y=r, name=f"{name} {r.iloc[-1]:+.1%}", line=dict(color=color, width=2),
+        fig.add_scatter(x=r.index, y=r, name=f"{name} {r.iloc[-1]:+.2%}", line=dict(color=color, width=2),
                         mode="lines+markers" if len(r) <= 25 else "lines", hovertemplate=f"{name}: %{{y:+.2%}}<extra></extra>")
     shade_bear(fig, p["rebalances"], t0, t1)
     fig.add_hline(y=0, line_color=AXIS, line_width=1)
     fig.update_layout(title=dict(text=f"Return from {t0:%b %d, %Y} close to {t1:%b %d, %Y} · gray = in T-bills"))
     st.plotly_chart(style(fig, 400, yfmt="+.0%"), width="stretch", key="perf_chart")
-    st.caption(f"Total returns through the {end:%b %d} close: the portfolio is the strategy's simulated "
+    st.caption(f"Total returns through the latest available prices on {end:%b %d, %Y}: "
+               "today's point may be intraday and delayed. Prices refresh about every 15 minutes during "
+               "the US session. The portfolio is the strategy's simulated "
                "daily value (it trades only at monthly rebalances), the S&P 500 is SPY and the Nasdaq-100 is "
-               "QQQ, both with dividends reinvested. Periods are trailing from the last close, like Yahoo Finance.")
+               "QQQ, both with dividends reinvested, so they differ from the quoted price indexes. "
+               "1D compares with the previous trading close; 5D spans five trading sessions; "
+               "month/year periods use the close on or before the calendar cutoff.")
 
 
 @st.fragment(run_every="10m")
@@ -344,7 +353,12 @@ def track_record() -> None:
     # ---- track record
     st.subheader("Backtested track record")
     nav, bench = p["nav"], p["bench"]
-    ndx = data.load_nasdaq().reindex(nav.index, method="ffill")
+    ndx = p["nasdaq"].reindex(nav.index)
+    if ndx.last_valid_index() is None:
+        st.warning("Nasdaq history is unavailable. Retry the data refresh to restore the comparison.")
+        return
+    if ndx.last_valid_index() != nav.index[-1]:
+        st.warning(f"Nasdaq history is only available through {ndx.last_valid_index():%b %d, %Y}.")
     ndx = ndx / ndx.iloc[0] * nav.iloc[0]
     S, B, N = (mt.summary(x, p["rf"]) for x in (nav, bench, ndx))
     k = st.columns(4)

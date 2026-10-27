@@ -1,4 +1,4 @@
-"""Live portfolio support: incremental data refresh, monthly schedule, current holdings, next trades.
+"""Live portfolio support: incremental data refresh, market-day schedule, holdings, next trades.
 
 The live portfolio is the Improved strategy (experiments.IMPROVED) run from 1996 to the latest
 close. Because the rank-40 buffer makes holdings path-dependent, current holdings are taken from
@@ -12,6 +12,7 @@ import io
 import json
 import time
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -24,7 +25,8 @@ from . import data
 from .experiments import IMPROVED
 
 STATE_FILE = data.DATA_DIR / "live_state.json"
-REFRESH_HOUR = 6  # local time on the 1st of the month; before the US open, after month-end data is final
+REFRESH_HOUR = 6  # New York time; catch up before the open
+MARKET_TZ = ZoneInfo("America/New_York")
 WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 
 LIVE_CONFIG = bt.Config(**IMPROVED, label="Momentum (Improved)")
@@ -42,27 +44,44 @@ def last_refresh() -> datetime | None:
     return datetime.fromisoformat(v) if v else None
 
 
+def _market_time(now: datetime) -> datetime:
+    # Naive callers supply New York wall time; persisted new timestamps include an offset.
+    return now.replace(tzinfo=MARKET_TZ) if now.tzinfo is None else now.astimezone(MARKET_TZ)
+
+
+def _refresh_slots(day: datetime) -> list[datetime]:
+    """Weekday catch-up, then every 15 minutes through 16:15 to capture the final close."""
+    if day.weekday() >= 5:
+        return []
+    midnight = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    minutes = [REFRESH_HOUR * 60, *range(9 * 60 + 30, 16 * 60 + 16, 15)]
+    return [midnight + timedelta(minutes=m) for m in minutes]
+
+
 def scheduled_time(now: datetime) -> datetime:
-    """The most recent scheduled refresh: the 1st of this month at REFRESH_HOUR."""
-    first = now.replace(day=1, hour=REFRESH_HOUR, minute=0, second=0, microsecond=0)
-    if now < first:  # early on the 1st, before the refresh hour: last month's slot
-        prev = (first - timedelta(days=1)).replace(day=1)
-        return prev
-    return first
+    """Most recent price-refresh slot, independent of the monthly trading schedule."""
+    now = _market_time(now)
+    for offset in range(4):
+        slots = [s for s in _refresh_slots(now - timedelta(days=offset)) if s <= now]
+        if slots:
+            return slots[-1]
+    raise RuntimeError("no previous refresh slot")
 
 
 def next_scheduled(now: datetime) -> datetime:
-    first = now.replace(day=1, hour=REFRESH_HOUR, minute=0, second=0, microsecond=0)
-    if now < first:
-        return first
-    return (first + timedelta(days=32)).replace(day=1)
+    now = _market_time(now)
+    for offset in range(4):
+        slots = [s for s in _refresh_slots(now + timedelta(days=offset)) if s > now]
+        if slots:
+            return slots[0]
+    raise RuntimeError("no next refresh slot")
 
 
 def should_refresh(now: datetime | None = None) -> bool:
-    """True if the 1st-of-month refresh hasn't run yet (also catches up after downtime)."""
-    now = now or datetime.now()
+    """Catch up missed price-refresh slots without changing monthly rebalance rules."""
+    now = now or datetime.now(MARKET_TZ)
     last = last_refresh()
-    return last is None or last < scheduled_time(now)
+    return last is None or _market_time(last) < scheduled_time(now)
 
 
 # ---------------------------------------------------------------- data refresh
@@ -129,6 +148,8 @@ def _check_download(c_new: pd.DataFrame, members: list[str], min_coverage: float
     if data.INDEX not in c_new.columns or c_new[data.INDEX].last_valid_index() is None:
         raise RuntimeError("price download failed: no data for the S&P 500 index")
     last = c_new[data.INDEX].last_valid_index()
+    if data.BENCH not in c_new or pd.isna(c_new.loc[last, data.BENCH]):
+        raise RuntimeError(f"price download incomplete: no SPY price for {last.date()}")
     # most recent completed session (federal holidays approximate NYSE), with slack for Yahoo lag
     # and exchange-only holidays such as Good Friday
     bday = CustomBusinessDay(calendar=USFederalHolidayCalendar())
@@ -179,16 +200,19 @@ def update_prices(log=print, overlap_days: int = 120) -> None:
 
 
 def refresh(log=print) -> None:
-    """Full monthly refresh: membership, prices, benchmarks, sectors for new names."""
+    """Refresh membership, prices, benchmarks and sectors for new names."""
     refresh_membership(log)
     update_prices(log)
-    try:
-        data.fetch_nasdaq()
-        data.fetch_spy_dividends()
-    except Exception as e:
-        log(f"benchmark refresh failed ({e})")
-    sectors = data.load_sectors()
+    # A failed benchmark download must not mark the refresh successful. Otherwise
+    # the app can silently show stale Nasdaq returns until the next refresh.
+    data.fetch_nasdaq()
+    data.fetch_spy_dividends()
     _, c = data.load_prices(supplement=False)
+    last_price = c[data.INDEX].last_valid_index()
+    last_nasdaq = data.load_nasdaq().last_valid_index()
+    if last_nasdaq is None or last_nasdaq < last_price:
+        raise RuntimeError(f"Nasdaq data is stale: ends {last_nasdaq}, prices reach {last_price}")
+    sectors = data.load_sectors()
     missing = [t for t in c.columns if t not in sectors and t not in data.EXTRA]
     if missing:
         log(f"sectors for {len(missing)} new symbols")
@@ -198,7 +222,7 @@ def refresh(log=print) -> None:
         new = pd.read_csv(path)
         pd.concat([old, new]).drop_duplicates("ticker", keep="last").to_csv(path, index=False)
     bt.clear_caches()
-    STATE_FILE.write_text(json.dumps({"last_refresh": datetime.now().isoformat(timespec="seconds")}))
+    STATE_FILE.write_text(json.dumps({"last_refresh": datetime.now(MARKET_TZ).isoformat(timespec="seconds")}))
     log("refresh complete")
 
 
@@ -288,7 +312,7 @@ def market_open(now: datetime | None = None) -> bool:
 
 # ---------------------------------------------------------------- data release (deployments)
 # Hosted copies (e.g. Streamlit Cloud) start with an empty disk. A GitHub Action refreshes the
-# data monthly and publishes it as a release asset; the app downloads it on a cold start.
+# data daily and publishes it as a release asset; the app downloads it on a cold start.
 import os  # noqa: E402
 import tarfile  # noqa: E402
 import tempfile  # noqa: E402
@@ -322,6 +346,17 @@ def download_data(log=print, url: str = DATA_URL) -> bool:
                 tmp.write(chunk)
         data.DATA_DIR.mkdir(exist_ok=True)
         with tarfile.open(tmp.name, "r:gz") as tar:
+            # A network/benchmark failure must not roll today's local prices back
+            # to yesterday's (or last month's) published bundle.
+            for name in ("close.parquet", "nasdaq100_tr.parquet"):
+                local = data.DATA_DIR / name
+                if local.exists() and name in tar.getnames():
+                    published = pd.read_parquet(io.BytesIO(tar.extractfile(name).read()))
+                    cached = pd.read_parquet(local)
+                    if published.index.max() < cached.index.max():
+                        log(f"published {name} is older; keeping local data")
+                        Path(tmp.name).unlink(missing_ok=True)
+                        return True
             for member in tar.getmembers():  # only plain files with known names: no path tricks
                 if member.isfile() and member.name in DATA_FILES:
                     src = tar.extractfile(member)
@@ -340,7 +375,7 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--refresh", action="store_true", help="download new data now")
-    ap.add_argument("--if-due", action="store_true", help="only refresh if the monthly refresh is due")
+    ap.add_argument("--if-due", action="store_true", help="only refresh if a price refresh is due")
     ap.add_argument("--download", action="store_true", help="fetch the published data bundle first")
     ap.add_argument("--pack", metavar="PATH", help="write the data bundle to PATH and exit")
     a = ap.parse_args()
