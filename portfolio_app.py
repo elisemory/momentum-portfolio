@@ -29,6 +29,23 @@ SERIES = ["#2a78d6", "#eb6834", "#1baf7a"]
 INK, INK2, MUTED, GRID, AXIS = "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7"
 GOOD, CRITICAL = "#006300", "#d03b3b"
 LOG_TICKS = [v * 10 ** e for e in range(4, 10) for v in (1, 2, 5)]
+TICKER_COLUMN = {"Ticker": st.column_config.LinkColumn(
+    "Ticker", help="Open in Yahoo Finance",
+    display_text=r"https://finance\.yahoo\.com/quote/([^/]+)/",
+)}
+
+
+def ticker_url(ticker: str) -> str:
+    return f"https://finance.yahoo.com/quote/{quote(ticker, safe='')}/"
+
+
+def ticker_link(ticker: str, label: str | None = None) -> str:
+    return f"[{label or ticker}]({ticker_url(ticker)})"
+
+
+def linked_tickers(frame: pd.DataFrame) -> pd.DataFrame:
+    """Link display copies only; calculations and sector lookups keep ticker symbols."""
+    return frame.assign(Ticker=frame["Ticker"].map(ticker_url))
 
 
 def style(fig, height=380, yfmt=None, log=False):
@@ -170,12 +187,14 @@ def main() -> None:
         st.caption("Preview based on the latest close. The final list is fixed by the last close of the month and "
                    "is available after the month-end price refresh.")
     if not p["bull"]:
-        st.error("**▼ Bear regime:** sell all stocks and hold T-bills (e.g. SGOV, BIL) until the regime turns bull.")
+        st.error(f"**▼ Bear regime:** sell all stocks and hold T-bills "
+                 f"(e.g. {ticker_link('SGOV')}, {ticker_link('BIL')}) until the regime turns bull.")
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown(f"**Sell ({len(p['sells'])})**")
         if p["sells"]:
-            st.dataframe(pd.DataFrame(p["sells"], columns=["Ticker", "Why"]), hide_index=True, width="stretch")
+            st.dataframe(linked_tickers(pd.DataFrame(p["sells"], columns=["Ticker", "Why"])),
+                         column_config=TICKER_COLUMN, hide_index=True, width="stretch")
         else:
             st.caption("Nothing to sell.")
     with c2:
@@ -183,14 +202,15 @@ def main() -> None:
         if p["buys"]:
             b = pd.DataFrame(p["buys"], columns=["Ticker", "Why"])
             b["Sector"] = b["Ticker"].map(data.load_sectors()).fillna("—")
-            st.dataframe(b, hide_index=True, width="stretch")
+            st.dataframe(linked_tickers(b), column_config=TICKER_COLUMN, hide_index=True, width="stretch")
             st.caption("Each new name gets up to 5% of the portfolio, funded by the sales.")
         else:
             st.caption("Nothing to buy.")
     with c3:
         st.markdown(f"**Trim to 10% ({len(p['trims'])})**")
         if p["trims"]:
-            st.dataframe(pd.DataFrame(p["trims"], columns=["Ticker", "Why"]), hide_index=True, width="stretch")
+            st.dataframe(linked_tickers(pd.DataFrame(p["trims"], columns=["Ticker", "Why"])),
+                         column_config=TICKER_COLUMN, hide_index=True, width="stretch")
         else:
             st.caption("No position above 10%.")
 
@@ -231,9 +251,9 @@ def holdings_section() -> None:
         k = st.columns(4)
         k[0].metric(f"Portfolio {'today' if is_open else 'last session'}", f"{port_today:+.2%}",
                     f"{(port_today - spx) * 100:+.2f} pts vs S&P")
-        k[1].metric("[S&P 500](https://finance.yahoo.com/quote/%5EGSPC/)", f"{spx:+.2%}",
+        k[1].metric(ticker_link("^GSPC", "S&P 500"), f"{spx:+.2%}",
                     session, delta_color="off", delta_arrow="off")
-        k[2].metric("[Nasdaq-100](https://finance.yahoo.com/quote/%5ENDX/)", f"{ndx:+.2%}",
+        k[2].metric(ticker_link("^NDX", "Nasdaq-100"), f"{ndx:+.2%}",
                     session, delta_color="off", delta_arrow="off")
         k[3].metric("Market", "● Open" if is_open else "○ Closed",
                     f"quotes updated {datetime.now():%H:%M:%S}", delta_color="off", delta_arrow="off")
@@ -241,7 +261,7 @@ def holdings_section() -> None:
         pos["price_now"], pos["today"] = np.nan, np.nan
 
     tab = pd.DataFrame({
-        "Ticker": pos["ticker"].map(lambda ticker: f"https://finance.yahoo.com/quote/{quote(ticker, safe='')}/"),
+        "Ticker": pos["ticker"],
         "Sector": pos["sector"], "Weight": pos["weight"],
         "Price": pos["price_now"], "Today": pos["today"],
         "Rank now": pos["rank"], "12-1 momentum": pos["momentum"], "6-1 momentum": pos["momentum_6_1"],
@@ -253,15 +273,12 @@ def holdings_section() -> None:
         tab = tab.drop(columns=["Price", "Today"])
     c1, c2 = st.columns([3, 1])
     with c1:
-        styled = (tab.style.format({"Weight": "{:.1%}", "Price": "${:,.2f}", "Today": "{:+.2%}", "Rank now": "{:.0f}",
+        styled = (linked_tickers(tab).style.format({"Weight": "{:.1%}", "Price": "${:,.2f}", "Today": "{:+.2%}", "Rank now": "{:.0f}",
                                     "12-1 momentum": "{:+.0%}", "6-1 momentum": "{:+.0%}",
                                     "Return since bought": "{:+.1%}"}, na_rep="—")
                   .map(color_change, subset=[c for c in ["Today"] if c in tab.columns]))
         st.dataframe(styled, hide_index=True, width="stretch", height=36 * (len(tab) + 1) + 4,
-                     column_config={"Ticker": st.column_config.LinkColumn(
-                         "Ticker", help="Open in Yahoo Finance",
-                         display_text=r"https://finance\.yahoo\.com/quote/([^/]+)/",
-                     )})
+                     column_config=TICKER_COLUMN)
         st.caption(f"Last rebalance {p['last_rebalance']:%b %d, %Y}. Today = change vs the previous close, "
                    "refreshed every minute (Yahoo quotes, may be delayed). Return since bought uses "
                    f"prices through {p['as_of']:%b %d}. The strategy does not trim winners except above 10%.")
@@ -298,8 +315,8 @@ def performance_section() -> None:
     nav = p["nav"]
     ndx = p["nasdaq"].reindex(nav.index)
     lines = {"Momentum portfolio": (nav, SERIES[0]),
-             "S&P 500 (SPY)": (p["performance_bench"].reindex(nav.index), SERIES[1]),
-             "Nasdaq-100 (QQQ)": (ndx, SERIES[2])}
+             "S&P 500": (p["performance_bench"].reindex(nav.index), SERIES[1]),
+             "Nasdaq-100": (ndx, SERIES[2])}
     idx, end = nav.index, nav.index[-1]
     st.subheader("Performance")
     missing = [name for name, (s, _) in lines.items() if pd.isna(s.loc[end])]
@@ -312,7 +329,10 @@ def performance_section() -> None:
 
     # ---- every trailing period at a glance
     grid = trailing_returns(pd.DataFrame({name: s for name, (s, _) in lines.items()}))
-    st.dataframe(grid.style.format("{:+,.2%}", na_rep="—").map(color_change), width="stretch")
+    grid = grid.rename(index={"S&P 500": ticker_link("SPY", "S&P 500 (SPY)"),
+                              "Nasdaq-100": ticker_link("QQQ", "Nasdaq-100 (QQQ)")})
+    # Static tables render Markdown links directly in row labels.
+    st.table(grid.style.format("{:+,.2%}", na_rep="—").map(color_change), width="stretch")
 
     # ---- chart for one period or a custom date range
     c1, c2 = st.columns([3, 2], vertical_alignment="bottom")
@@ -350,8 +370,8 @@ def performance_section() -> None:
                "today's point may be intraday and delayed. Prices refresh about every 15 minutes during "
                "the US session. The portfolio is the strategy's simulated "
                "daily value (it trades only at monthly rebalances), the S&P 500 is "
-               "[SPY](https://finance.yahoo.com/quote/SPY/) and the Nasdaq-100 is "
-               "[QQQ](https://finance.yahoo.com/quote/QQQ/), both with dividends reinvested, "
+               f"{ticker_link('SPY')} and the Nasdaq-100 is "
+               f"{ticker_link('QQQ')}, both with dividends reinvested, "
                "so they differ from the quoted price indexes. "
                "1D compares with the previous trading close; 5D spans five trading sessions; "
                "month/year periods use the close on or before the calendar cutoff.")
@@ -395,7 +415,8 @@ def track_record() -> None:
     with st.expander("Before you trade: what the research found"):
         st.markdown("""
 - **Taxes matter a lot.** About two-thirds of gains are short-term. At a 30% rate the backtested CAGR falls from
-  ~18% to ~14%, and since 2011 it roughly ties or trails buy-and-hold SPY after tax. Use a tax-advantaged account.
+  ~18% to ~14%, and since 2011 it roughly ties or trails buy-and-hold
+  [SPY](https://finance.yahoo.com/quote/SPY/) after tax. Use a tax-advantaged account.
 - **Since 2011 the Nasdaq-100 did better** (about 19% vs 16% a year) with less volatility. The strategy's edge over
   the full period comes mostly from avoiding the 2000–02 and 2008 crashes.
 - **One-month crashes can't be avoided** by a monthly rule. COVID took the portfolio down 39% in 2020.
