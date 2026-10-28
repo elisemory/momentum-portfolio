@@ -231,8 +231,10 @@ def holdings_section() -> None:
         k = st.columns(4)
         k[0].metric(f"Portfolio {'today' if is_open else 'last session'}", f"{port_today:+.2%}",
                     f"{(port_today - spx) * 100:+.2f} pts vs S&P")
-        k[1].metric("S&P 500", f"{spx:+.2%}", session, delta_color="off", delta_arrow="off")
-        k[2].metric("Nasdaq-100", f"{ndx:+.2%}", session, delta_color="off", delta_arrow="off")
+        k[1].metric("[S&P 500](https://finance.yahoo.com/quote/%5EGSPC/)", f"{spx:+.2%}",
+                    session, delta_color="off", delta_arrow="off")
+        k[2].metric("[Nasdaq-100](https://finance.yahoo.com/quote/%5ENDX/)", f"{ndx:+.2%}",
+                    session, delta_color="off", delta_arrow="off")
         k[3].metric("Market", "● Open" if is_open else "○ Closed",
                     f"quotes updated {datetime.now():%H:%M:%S}", delta_color="off", delta_arrow="off")
     else:
@@ -347,8 +349,10 @@ def performance_section() -> None:
     st.caption(f"Total returns through the latest available prices on {end:%b %d, %Y}: "
                "today's point may be intraday and delayed. Prices refresh about every 15 minutes during "
                "the US session. The portfolio is the strategy's simulated "
-               "daily value (it trades only at monthly rebalances), the S&P 500 is SPY and the Nasdaq-100 is "
-               "QQQ, both with dividends reinvested, so they differ from the quoted price indexes. "
+               "daily value (it trades only at monthly rebalances), the S&P 500 is "
+               "[SPY](https://finance.yahoo.com/quote/SPY/) and the Nasdaq-100 is "
+               "[QQQ](https://finance.yahoo.com/quote/QQQ/), both with dividends reinvested, "
+               "so they differ from the quoted price indexes. "
                "1D compares with the previous trading close; 5D spans five trading sessions; "
                "month/year periods use the close on or before the calendar cutoff.")
 
