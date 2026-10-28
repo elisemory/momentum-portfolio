@@ -11,6 +11,7 @@ from __future__ import annotations
 import threading
 import time
 from datetime import datetime
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
@@ -238,7 +239,8 @@ def holdings_section() -> None:
         pos["price_now"], pos["today"] = np.nan, np.nan
 
     tab = pd.DataFrame({
-        "Ticker": pos["ticker"], "Sector": pos["sector"], "Weight": pos["weight"],
+        "Ticker": pos["ticker"].map(lambda ticker: f"https://finance.yahoo.com/quote/{quote(ticker, safe='')}/"),
+        "Sector": pos["sector"], "Weight": pos["weight"],
         "Price": pos["price_now"], "Today": pos["today"],
         "Rank now": pos["rank"], "12-1 momentum": pos["momentum"], "6-1 momentum": pos["momentum_6_1"],
         "Held since": pos["entry"].dt.date, "Return since bought": pos["gain"],
@@ -253,7 +255,11 @@ def holdings_section() -> None:
                                     "12-1 momentum": "{:+.0%}", "6-1 momentum": "{:+.0%}",
                                     "Return since bought": "{:+.1%}"}, na_rep="—")
                   .map(color_change, subset=[c for c in ["Today"] if c in tab.columns]))
-        st.dataframe(styled, hide_index=True, width="stretch", height=36 * (len(tab) + 1) + 4)
+        st.dataframe(styled, hide_index=True, width="stretch", height=36 * (len(tab) + 1) + 4,
+                     column_config={"Ticker": st.column_config.LinkColumn(
+                         "Ticker", help="Open in Yahoo Finance",
+                         display_text=r"https://finance\.yahoo\.com/quote/([^/]+)/",
+                     )})
         st.caption(f"Last rebalance {p['last_rebalance']:%b %d, %Y}. Today = change vs the previous close, "
                    "refreshed every minute (Yahoo quotes, may be delayed). Return since bought uses "
                    f"prices through {p['as_of']:%b %d}. The strategy does not trim winners except above 10%.")
