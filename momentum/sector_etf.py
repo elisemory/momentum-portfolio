@@ -58,7 +58,8 @@ def universe(etfs: list[str] = ETFS):
     regime inputs stay valid: the ETF market shares the stock market's dates, index and T-bills."""
     m = market(etfs)
     saved = bt.load_market, bt._membership
-    bt.load_market, bt._membership = (lambda: m), (lambda universe: m.has_price)
+    bt.load_market = lambda point_in_time_filter=False: m
+    bt._membership = lambda universe, point_in_time_filter=False: m.has_price
     try:
         yield m
     finally:

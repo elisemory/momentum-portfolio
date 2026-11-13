@@ -11,12 +11,47 @@ returns are total returns.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from functools import lru_cache
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import lru_cache, wraps
 
 import numpy as np
 import pandas as pd
 
 from . import data
+
+
+# A dashboard session can supply a different market without changing global data
+# or leaking cached ranks/regimes into another Streamlit session or the live app.
+_market_context = ContextVar('backtest_market', default=None)
+
+
+def market_cache(maxsize):
+    def decorate(fn):
+        default = lru_cache(maxsize=maxsize)(fn)
+        @wraps(fn)
+        def wrapped(*args, **kwargs):
+            context = _market_context.get()
+            if context is None:
+                return default(*args, **kwargs)
+            key = (fn.__name__, args, tuple(sorted(kwargs.items())))
+            if key not in context['cache']:
+                context['cache'][key] = fn(*args, **kwargs)
+            return context['cache'][key]
+        wrapped.cache_clear = default.cache_clear
+        return wrapped
+    return decorate
+
+
+@contextmanager
+def using_market(market, membership):
+    if membership.shape != market.has_price.shape:
+        raise ValueError('Membership must match the supplied market')
+    token = _market_context.set(dict(market=market, membership=membership, cache={}))
+    try:
+        yield
+    finally:
+        _market_context.reset(token)
 
 
 @dataclass(frozen=True)
@@ -28,6 +63,7 @@ class Config:
     lookback_months: int = 12
     skip_months: int = 1
     regime_filter: bool = True
+    regime_index: str = "sp500"      # "sp500" | "nasdaq100", independent of stock universe
     sma_days: int = 200
     universe: str = "pit"           # "pit" (point-in-time) | "current" (today's members, biased)
     quality_gate: bool = False
@@ -35,6 +71,8 @@ class Config:
     cost_bps: float = 10.0
     # ---- optional improvements (defaults = spec as written)
     score: str = "raw"              # "raw" 12-1 return | "risk_adjusted": 12-1 return / trailing 1y volatility
+                                    #   | "blend": 12-1 + 6-1 ranks | "blend3": 12-1 + 6-1 + 3-1 ranks
+                                    #   | "low_vol": lowest trailing 1y volatility first
     sma_band: float = 0.0           # hysteresis around the SMA, e.g. 0.02 = exit < SMA-2%, re-enter > SMA+2%
     vol_target: float = 0.0         # e.g. 0.15 = scale equity exposure to ~15% ex-ante vol (0 = off)
     max_weight: float = 0.0         # e.g. 0.10 = trim any position above 10% of NAV (0 = off)
@@ -48,6 +86,15 @@ class Config:
     weighting: str = "equal"        # "equal" | "inverse_vol" (weights proportional to 1 / 6-month volatility)
     sector_cap: int = 0             # max holdings per sector when buying (0 = off)
     core_spy: float = 0.0           # share of capital held in SPY, rebalanced monthly (0 = off)
+    max_vol_pct: float = 1.0        # drop stocks above this percentile of trailing 1y vol before ranking (1 = off)
+    rebalance_day: int = 0          # trade on this trading day of the month (0 = first); for staggered tranches
+    daily_signal: bool = False      # momentum from closes 21*skip / 21*lookback trading days back, not month-ends
+    point_in_time_filter: bool = False
+    covariance_penalty: float = 0.0
+    sector_penalty: float = 0.0
+    replacement_margin: float = 0.0
+    cap_trim_band: float = 0.0
+    delisting_haircut: float = 0.0
     # ---- taxes (taxable account). 0 = tax-free account.
     tax_short: float = 0.0          # rate on realised gains from lots held <= 1 year
     tax_long: float | None = None   # rate on lots held > 1 year (None = same as tax_short)
@@ -83,14 +130,23 @@ class Market:
     bench_close: pd.Series
     tbill_daily: pd.Series
     has_price: np.ndarray    # bool, close available
+    extreme_ok: np.ndarray | None = None
 
 
-@lru_cache(maxsize=2)
-def load_market() -> Market:
+@market_cache(maxsize=4)
+def load_market(point_in_time_filter: bool = False) -> Market:
+    context = _market_context.get()
+    if context is not None:
+        return context['market']
     o, c = data.load_prices()
+    return prepare_market(o, c, point_in_time_filter)
+
+
+def prepare_market(o: pd.DataFrame, c: pd.DataFrame, point_in_time_filter: bool = False) -> Market:
     idx = c[data.INDEX].dropna()
     dates = idx.index
-    bad = data.bad_tickers(c.drop(columns=[x for x in data.EXTRA if x in c.columns]))
+    bad = (data.BLOCKLIST if point_in_time_filter else
+           data.bad_tickers(c.drop(columns=[x for x in data.EXTRA if x in c.columns])))
     tickers = [t for t in c.columns if t not in data.EXTRA and t not in bad]
     O = o.reindex(index=dates, columns=tickers)
     C = c.reindex(index=dates, columns=tickers)
@@ -99,25 +155,34 @@ def load_market() -> Market:
     # a month-end price only counts if the stock actually traded in the last week of the month
     last_day = pd.Series(dates, index=dates).groupby(dates.to_period("M")).last()
     me = me.where(C.reindex(last_day.values).ffill(limit=5).notna().values)
+    if point_in_time_filter:
+        me = pd.DataFrame(Cff.reindex(last_day.values).to_numpy(), index=last_day.index, columns=tickers)
     irx = c[data.TBILL].reindex(dates).ffill().fillna(0.0)
     tb = (irx / 100.0 / 252.0).shift(1).fillna(0.0)
+    extreme_ok = None
+    if point_in_time_filter:
+        returns = Cff.pct_change(fill_method=None)
+        extreme_ok = (((returns > 1.0) | (returns < -0.75)).cumsum() < 3).to_numpy()
     return Market(
         dates=dates, tickers=tickers, open=O.to_numpy(), close=C.to_numpy(),
         close_ff=Cff.to_numpy(), month_end=me, index_close=idx,
         bench_close=c[data.BENCH].reindex(dates).ffill(), tbill_daily=tb,
-        has_price=C.notna().to_numpy(),
+        has_price=C.notna().to_numpy(), extreme_ok=extreme_ok,
     )
 
 
-@lru_cache(maxsize=4)
-def _membership(universe: str) -> np.ndarray:
-    m = load_market()
+@market_cache(maxsize=4)
+def _membership(universe: str, point_in_time_filter: bool = False) -> np.ndarray:
+    context = _market_context.get()
+    if context is not None:
+        return context['membership']
+    m = load_market(point_in_time_filter)
     return data.membership_matrix(m.dates, m.tickers, universe).to_numpy()
 
 
-@lru_cache(maxsize=2)
-def _quality() -> tuple[np.ndarray, np.ndarray]:
-    m = load_market()
+@market_cache(maxsize=2)
+def _quality(point_in_time_filter: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    m = load_market(point_in_time_filter)
     p, h = data.quality_matrix(m.dates, m.tickers)
     return p.to_numpy(), h.to_numpy()
 
@@ -130,15 +195,29 @@ def momentum_scores(m: Market, month: pd.Period, lookback: int, skip: int) -> pd
     return m.month_end.loc[recent] / m.month_end.loc[past] - 1.0
 
 
-@lru_cache(maxsize=16)
-def _regime_inputs(sma_days: int, slope_days: int = 21) -> dict[str, np.ndarray]:
+def momentum_daily(m: Market, s: int, lookback: int, skip: int) -> np.ndarray:
+    """Momentum known at the close of day index `s`, from closes 21*skip and 21*lookback trading days back."""
+    a, b = s - 21 * skip, s - 21 * lookback
+    if b < 0:
+        return np.full(len(m.tickers), np.nan)
+    return m.close_ff[a] / m.close_ff[b] - 1.0
+
+
+@market_cache(maxsize=16)
+def _regime_inputs(sma_days: int, slope_days: int = 21, regime_index: str = "sp500") -> dict[str, np.ndarray]:
     m = load_market()
     px = m.index_close
+    spy = m.bench_close
+    if regime_index == "nasdaq100":
+        from .universes import load_nasdaq_index
+        px = load_nasdaq_index().reindex(m.dates)
+        spy = data.load_nasdaq().reindex(m.dates)
+    elif regime_index != "sp500":
+        raise ValueError(f"Unknown regime index: {regime_index}")
     months = px.index.to_period("M")
     me = px.groupby(months).last()
     # 10-month SMA: the 9 previous month-end closes plus today's close
     prev9 = me.rolling(9).sum().shift(1).reindex(months).to_numpy()
-    spy = m.bench_close
     tbill_growth = (1 + m.tbill_daily).cumprod()
     return dict(
         spx=px.to_numpy(),
@@ -153,8 +232,10 @@ def _regime_inputs(sma_days: int, slope_days: int = 21) -> dict[str, np.ndarray]
 
 def regime_state(cfg: Config, m: Market, s: int, was_bull: bool | None = None) -> tuple[bool, float, float]:
     """(bull?, index close, trend line) using information up to the close of day index `s`."""
-    x = _regime_inputs(cfg.sma_days, cfg.slope_days)
+    x = _regime_inputs(cfg.sma_days, cfg.slope_days, cfg.regime_index)
     spx = float(x["spx"][s])
+    if not np.isfinite(spx):
+        raise ValueError(f"Missing {cfg.regime_index} regime price on {m.dates[s].date()}")
     line = float(x["faber"][s] if cfg.regime_rule == "faber" else x["sma"][s])
     if not np.isfinite(line):
         return True, spx, np.nan
@@ -183,9 +264,9 @@ def regime_is_bull(m: Market, s: int, sma_days: int, band: float = 0.0,
     return regime_state(Config(sma_days=sma_days, sma_band=band), m, s, was_bull)
 
 
-@lru_cache(maxsize=1)
-def _sector_codes() -> np.ndarray:
-    m = load_market()
+@market_cache(maxsize=2)
+def _sector_codes(point_in_time_filter: bool = False) -> np.ndarray:
+    m = load_market(point_in_time_filter)
     sec = data.load_sectors()
     return np.array([sec.get(t, "Unknown") for t in m.tickers], dtype=object)
 
@@ -196,10 +277,10 @@ def clear_caches() -> None:
         f.cache_clear()
 
 
-@lru_cache(maxsize=1)
-def _monthly_returns() -> tuple[np.ndarray, np.ndarray]:
+@market_cache(maxsize=2)
+def _monthly_returns(point_in_time_filter: bool = False) -> tuple[np.ndarray, np.ndarray]:
     """(stock returns [month x ticker], SPY total return [month]) aligned with Market.month_end."""
-    m = load_market()
+    m = load_market(point_in_time_filter)
     r = m.month_end.pct_change(fill_method=None).to_numpy()
     mkt = m.bench_close.groupby(m.dates.to_period("M")).last().pct_change()
     return r, mkt.reindex(m.month_end.index).to_numpy()
@@ -215,7 +296,7 @@ def residual_momentum(m: Market, month: pd.Period, cols: np.ndarray, lookback: i
     out = np.full(len(cols), np.nan)
     if k < window:
         return out
-    r, mkt = _monthly_returns()
+    r, mkt = _monthly_returns(m.extreme_ok is not None)
     Y = r[k - window + 1 : k + 1][:, cols]
     x = mkt[k - window + 1 : k + 1]
     form = slice(window - lookback, window - skip)  # rows of months M-lookback .. M-1-skip
@@ -260,29 +341,43 @@ def trailing_vol_basket(m: Market, s: int, cols, days: int = 126) -> float:
 
 def rank_universe(cfg: Config, m: Market, s: int, month: pd.Period) -> pd.DataFrame:
     """Eligible stocks ranked by momentum as of signal day index `s`."""
-    mom = momentum_scores(m, month, cfg.lookback_months, cfg.skip_months).to_numpy()
-    elig = _membership(cfg.universe)[s] & m.has_price[s] & np.isfinite(mom)
+    def mom_at(lookback):
+        if cfg.daily_signal:
+            return momentum_daily(m, s, lookback, cfg.skip_months)
+        return momentum_scores(m, month, lookback, cfg.skip_months).to_numpy()
+
+    mom = mom_at(cfg.lookback_months)
+    elig = _membership(cfg.universe, cfg.point_in_time_filter)[s] & m.has_price[s] & np.isfinite(mom)
+    if m.extreme_ok is not None:
+        elig &= m.extreme_ok[s]
     if cfg.quality_gate:
-        elig &= _quality()[0][s]
+        elig &= _quality(cfg.point_in_time_filter)[0][s]
     idx = np.flatnonzero(elig)
+    if cfg.max_vol_pct < 1 and len(idx):
+        vol = trailing_vol(m, s, idx)
+        idx = idx[vol <= np.nanquantile(vol, cfg.max_vol_pct)]
     score = mom.copy()
     if cfg.score == "risk_adjusted" and len(idx):
         vol = trailing_vol(m, s, idx)
         score[idx] = np.where(vol > 0, mom[idx] / vol, np.nan)
         idx = idx[np.isfinite(score[idx])]
-    elif cfg.score == "blend" and len(idx):
-        # average percentile rank of 12-1 and 6-1 momentum
-        mom6 = momentum_scores(m, month, 6, cfg.skip_months).to_numpy()
-        ok = idx[np.isfinite(mom6[idx])]
+    elif cfg.score in ("blend", "blend3") and len(idx):
+        # average percentile rank of 12-1 and 6-1 (and 3-1) momentum
+        others = [mom_at(6)] + ([mom_at(3)] if cfg.score == "blend3" else [])
+        ok = idx[np.isfinite(np.column_stack([o[idx] for o in others])).all(1)]
         pr = lambda v: pd.Series(v).rank(pct=True).to_numpy()  # noqa: E731
         score[:] = np.nan
-        score[ok] = (pr(mom[ok]) + pr(mom6[ok])) / 2
+        score[ok] = sum(pr(v[ok]) for v in [mom] + others) / (1 + len(others))
         idx = ok
+    elif cfg.score == "low_vol" and len(idx):
+        vol = trailing_vol(m, s, idx)
+        score[idx] = np.where(vol > 0, -vol, np.nan)
+        idx = idx[np.isfinite(score[idx])]
     elif cfg.score in ("residual", "residual_sector") and len(idx):
         # momentum net of market (and sector) moves: avoids buying a basket that is just one hot
         # sector or the highest-beta names
         score[idx] = residual_momentum(m, month, idx, cfg.lookback_months, cfg.skip_months,
-                                       _sector_codes() if cfg.score == "residual_sector" else None)
+                                       _sector_codes(cfg.point_in_time_filter) if cfg.score == "residual_sector" else None)
         idx = idx[np.isfinite(score[idx])]
     elif cfg.score == "high52" and len(idx):
         # George & Hwang (2004): closeness to the 52-week high, ties broken by 12-1 momentum
@@ -305,14 +400,58 @@ def rank_universe(cfg: Config, m: Market, s: int, month: pd.Period) -> pd.DataFr
 
 
 # ---------------------------------------------------------------- engine
+def trailing_covariance(m: Market, signal: int, columns, days: int = 126) -> np.ndarray:
+    """Annualized, 25%-diagonal-shrunk covariance using only observed past returns."""
+    prices = m.close_ff[max(0, signal - days):signal + 1][:, columns]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        returns = prices[1:] / prices[:-1] - 1
+    returns = returns[np.isfinite(returns).all(axis=1)]
+    if len(returns) < 60:
+        return np.zeros((len(columns), len(columns)))
+    covariance = np.atleast_2d(np.cov(returns, rowvar=False)) * 252
+    return 0.75 * covariance + 0.25 * np.diag(np.diag(covariance))
+
+
+def diversified_order(cfg: Config, m: Market, signal: int, ranks: pd.DataFrame,
+                      held_values: dict, available: list[int], slots: int, sectors) -> list[int]:
+    """Choose near-ranked additions sequentially, penalizing marginal covariance or sector weight."""
+    pool = available[:max(60, cfg.top_n * 3)]
+    columns = list(dict.fromkeys(list(held_values) + pool))
+    positions = {column: offset for offset, column in enumerate(columns)}
+    covariance = trailing_covariance(m, signal, columns) if cfg.covariance_penalty else None
+    values = np.array([held_values.get(column, 0.0) for column in columns])
+    scores = ranks.set_index("col")["score"].to_dict()
+    addition_value = sum(held_values.values()) / len(held_values) if held_values else 1.0
+    selected = []
+    for _ in range(min(slots, len(pool))):
+        best_score = max(scores[column] for column in pool)
+        candidates = [column for column in pool if scores[column] >= best_score - 0.05]
+        weights = values / values.sum() if values.sum() else values
+        marginal = covariance @ weights if covariance is not None else np.zeros(len(columns))
+        variance = float(weights @ marginal)
+        def utility(column):
+            risk = max(0.0, marginal[positions[column]]) / variance if variance > 0 else 0.0
+            sector_weight = (sum(weights[offset] for offset, member in enumerate(columns)
+                                 if sectors[member] == sectors[column])
+                             if sectors is not None and sectors[column] != "Unknown" else 0.0)
+            return scores[column] - cfg.covariance_penalty * min(risk, 3.0) - cfg.sector_penalty * sector_weight
+        chosen = max(candidates, key=utility)
+        selected.append(chosen)
+        values[positions[chosen]] = addition_value
+        pool.remove(chosen)
+    return selected + [column for column in available if column not in selected]
+
+
 def run(cfg: Config) -> Result:
-    m = load_market()
+    m = load_market(cfg.point_in_time_filter)
     dates = m.dates
     start = dates.searchsorted(pd.Timestamp(cfg.start))
     end = len(dates) if cfg.end is None else dates.searchsorted(pd.Timestamp(cfg.end), side="right")
     start = max(start, 1)
     months = dates.to_period("M")
     first_of_month = np.r_[True, months[1:] != months[:-1]]
+    day_of_month = np.arange(len(dates)) - np.maximum.accumulate(np.where(first_of_month, np.arange(len(dates)), 0))
+    rebalance_day = day_of_month == cfg.rebalance_day
     c = cfg.cost_bps / 1e4
     tb = m.tbill_daily.to_numpy()
 
@@ -425,7 +564,7 @@ def run(cfg: Config) -> Result:
             done += d * scale
         return done
 
-    sectors = _sector_codes() if cfg.sector_cap > 0 else None
+    sectors = _sector_codes(cfg.point_in_time_filter) if cfg.sector_cap > 0 or cfg.sector_penalty > 0 else None
     was_bull = None
     for t in range(start, end):
         if taxed and cash > 0:
@@ -448,7 +587,7 @@ def run(cfg: Config) -> Result:
                 for j, v in vals.items():
                     trim(t, j, need * v / tot, px_open(t, j), "pay taxes")
 
-        trigger = first_of_month[t]
+        trigger = rebalance_day[t]
         if not trigger and cfg.regime_daily and cfg.regime_filter and was_bull is not None:
             trigger = regime_state(cfg, m, t - 1, was_bull)[0] != was_bull
         if trigger:
@@ -474,9 +613,17 @@ def run(cfg: Config) -> Result:
                     n_sold += 1
             else:
                 keep_rank = max(cfg.buffer_rank, cfg.top_n)
+                score_of = dict(zip(ranks["col"], ranks["score"]))
+                replacements = [column for column in ranks["col"]
+                                if column not in shares and np.isfinite(m.open[t, column])]
                 for j in list(shares):
                     r = rank_of.get(j)
                     if r is None or r > keep_rank:
+                        if cfg.replacement_margin > 0 and r is not None:
+                            if not replacements or score_of[replacements[0]] - score_of[j] < cfg.replacement_margin:
+                                continue
+                        if replacements:
+                            replacements.pop(0)
                         p = px_open(t, j)
                         traded += shares[j] * p
                         sell(t, j, p, "left universe" if r is None else f"rank {r} > {keep_rank}")
@@ -487,12 +634,19 @@ def run(cfg: Config) -> Result:
                 if sectors is not None:
                     for j in shares:
                         sec_count[sectors[j]] = sec_count.get(sectors[j], 0) + 1
-                for j in ranks["col"]:
+                additions = ranks["col"]
+                if cfg.covariance_penalty > 0 or cfg.sector_penalty > 0:
+                    available = [column for column in additions
+                                 if column not in shares and np.isfinite(m.open[t, column])]
+                    held_values = {column: amount * m.close_ff[s_, column]
+                                   for column, amount in shares.items()}
+                    additions = diversified_order(cfg, m, s_, ranks, held_values, available, slots, sectors)
+                for j in additions:
                     if slots <= 0:
                         break
                     if j in shares or not np.isfinite(m.open[t, j]):
                         continue
-                    if sectors is not None and sectors[j] != "Unknown":
+                    if cfg.sector_cap > 0 and sectors[j] != "Unknown":
                         if sec_count.get(sectors[j], 0) >= cfg.sector_cap:
                             continue
                         sec_count[sectors[j]] = sec_count.get(sectors[j], 0) + 1
@@ -521,7 +675,7 @@ def run(cfg: Config) -> Result:
                         for j in list(shares):
                             p = px_open(t, j)
                             excess = shares[j] * p - cap
-                            if excess > 0:
+                            if excess > cfg.cap_trim_band * nav_now:
                                 traded += trim(t, j, excess, p, f"above {cfg.max_weight:.0%} cap")
                     # new names get sale proceeds, up to an equal 1/N weight each (never above the cap)
                     per = min(nav_now / cfg.top_n, cap)
@@ -537,7 +691,7 @@ def run(cfg: Config) -> Result:
                                                nav_now, rank_of, trims=False)
 
             rebal_rows.append(dict(date=dates[t], regime="bull" if bull else "bear", spx=spx, sma=sma,
-                                   eligible=len(ranks), members=int(_membership(cfg.universe)[s_].sum()),
+                                   eligible=len(ranks), members=int(_membership(cfg.universe, cfg.point_in_time_filter)[s_].sum()),
                                    holdings=len(shares), sold=n_sold, bought=n_bought,
                                    exposure=exposure,
                                    turnover=traded / nav_open / 2 if nav_open > 0 else 0.0,
@@ -556,7 +710,7 @@ def run(cfg: Config) -> Result:
             if np.isfinite(p):
                 last_px[j] = p
             else:
-                sell(t, j, last_px.get(j, 0.0), "stopped trading")
+                sell(t, j, last_px.get(j, 0.0) * (1 - cfg.delisting_haircut), "stopped trading")
 
         pos = sum(q * m.close_ff[t, j] for j, q in shares.items())
         nav[t] = cash + pos
@@ -599,7 +753,7 @@ def run(cfg: Config) -> Result:
     bench = bench / bench.iloc[0] * cfg.initial_capital
     inv_s = pd.Series(invested[sl], index=dates[sl])
     if cfg.core_spy > 0:
-        nav_s, inv_s = _with_core(nav_s, bench, inv_s, cfg.core_spy, c, first_of_month[sl])
+        nav_s, inv_s = _with_core(nav_s, bench, inv_s, cfg.core_spy, c, rebalance_day[sl])
     trades = pd.DataFrame(trade_rows, columns=["date", "ticker", "side", "shares", "price", "notional", "reason"])
     holdings = pd.DataFrame(hold_rows, columns=["date", "ticker", "rank", "momentum", "weight"])
     return Result(cfg, nav_s, bench.rename("S&P 500 (SPY TR)"), m.tbill_daily.iloc[sl],
@@ -632,7 +786,7 @@ def _with_core(sleeve: pd.Series, spy: pd.Series, invested: pd.Series, core: flo
 
 def live_signal(cfg: Config) -> dict:
     """What the model says today, for the next first-of-month rebalance."""
-    m = load_market()
+    m = load_market(cfg.point_in_time_filter)
     s = len(m.dates) - 1
     next_month = m.dates[-1].to_period("M") + 1
     bull, spx, sma = regime_state(cfg, m, s)

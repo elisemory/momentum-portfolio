@@ -85,6 +85,63 @@ class RefreshTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no SPY price"):
             live._check_download(prices, ["AAA"], now=datetime(2026, 10, 27))
 
+    def test_index_only_latest_row_is_dropped_before_the_check(self):
+        idx = pd.to_datetime(["2026-10-27", "2026-10-28"])
+        c = pd.DataFrame({data.INDEX: [100., 101.], data.BENCH: [50., np.nan],
+                          "AAA": [10., np.nan], "BBB": [20., np.nan]}, index=idx)
+        o, c2 = live._drop_index_only_tail(c.copy(), c)
+        self.assertEqual(list(c2.index), [idx[0]])
+        self.assertEqual(list(o.index), [idx[0]])
+        live._check_download(c2, ["AAA", "BBB"], now=datetime(2026, 10, 28, 20))
+
+    def test_missing_spy_with_stock_prices_is_not_dropped(self):
+        prices = pd.DataFrame({data.INDEX: [100., 101.], data.BENCH: [100., np.nan],
+                               "AAA": [50., 51.]}, index=pd.to_datetime(["2026-10-26", "2026-10-27"]))
+        _, kept = live._drop_index_only_tail(prices, prices)
+        self.assertEqual(len(kept), 2)
+
+    def test_dropping_index_only_tail_still_rejects_stale_prices(self):
+        idx = pd.to_datetime(["2026-10-12", "2026-10-28"])
+        prices = pd.DataFrame({data.INDEX: [100., 101.], data.BENCH: [50., np.nan],
+                               "AAA": [10., np.nan]}, index=idx)
+        _, kept = live._drop_index_only_tail(prices, prices)
+        with self.assertRaisesRegex(RuntimeError, "stale"):
+            live._check_download(kept, ["AAA"], now=datetime(2026, 10, 29))
+
+    def test_update_prices_does_not_restore_index_only_tail_from_new_members(self):
+        idx = pd.to_datetime(["2026-10-27", "2026-10-28"])
+        prices = pd.DataFrame({data.INDEX: [100., 101.], data.BENCH: [50., np.nan],
+                               "AAA": [10., np.nan]}, index=idx)
+        new_member = pd.DataFrame({"BBB": [20., 21.]}, index=idx)
+        membership = pd.DataFrame({"tickers": [["AAA", "BBB"]]})
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(data, "DATA_DIR", Path(directory)), \
+                patch.object(data, "load_prices", return_value=(prices.iloc[:1], prices.iloc[:1])), \
+                patch.object(data, "load_membership", return_value=membership), \
+                patch.object(live, "_download", side_effect=[(prices, prices), (new_member, new_member)]), \
+                patch.object(live, "datetime") as clock:
+            clock.now.return_value = datetime(2026, 10, 29)
+            live.update_prices(log=lambda *_: None)
+            for field in ("open", "close"):
+                saved = pd.read_parquet(Path(directory) / f"{field}.parquet")
+                self.assertEqual(list(saved.index), [idx[0]])
+                self.assertEqual(saved.loc[idx[0], "BBB"], 20.)
+
+    def test_quotes_never_show_a_missing_bar_as_flat(self):
+        idx = pd.to_datetime(["2026-10-26", "2026-10-27", "2026-10-28"])
+        yahoo = pd.DataFrame({"AAA": [10., 11., np.nan], "BBB": [20., 21., np.nan],
+                              "^GSPC": [100., 101., 102.]}, index=idx)
+        cached = pd.DataFrame({"AAA": [9., 10., 11.]}, index=idx)  # adjusted closes: +10% on the 28th
+        fake_yf = type("yf", (), {"download": staticmethod(lambda *a, **k: pd.concat({"Close": yahoo}, axis=1))})
+        with patch.dict("sys.modules", {"yfinance": fake_yf}), \
+                patch.object(data, "load_prices", return_value=(cached, cached)):
+            q, day = live.quotes(["AAA", "BBB", "^GSPC"])
+        self.assertEqual(day, idx[-1])
+        self.assertAlmostEqual(q.loc["AAA", "change"], 0.10)  # filled from the cache
+        self.assertAlmostEqual(q.loc["AAA", "price"], 12.1)
+        self.assertTrue(np.isnan(q.loc["BBB", "change"]))     # unknown, not 0%
+        self.assertAlmostEqual(q.loc["^GSPC", "change"], 102 / 101 - 1)
+
     def test_benchmark_failure_does_not_mark_refresh_successful(self):
         with patch.object(live, "refresh_membership"), patch.object(live, "update_prices"), \
                 patch.object(data, "fetch_nasdaq", side_effect=RuntimeError("download failed")), \

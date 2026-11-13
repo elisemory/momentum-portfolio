@@ -280,3 +280,78 @@ def fetch_spy_dividends() -> None:
     h = yf.Ticker(BENCH).history(start=PRICE_START, auto_adjust=False)
     h.index = h.index.tz_localize(None)
     h[["Close", "Dividends"]].to_parquet(DATA_DIR / "spy_unadjusted.parquet")
+
+
+# ---------------------------------------------------------------- volume (CAN SLIM app)
+def _download_volume(syms: list[str], start: str, chunk: int = 80, log=print) -> pd.DataFrame:
+    import yfinance as yf
+
+    vols = []
+    for i in range(0, len(syms), chunk):
+        batch = syms[i : i + chunk]
+        log(f"volume {i + 1}-{i + len(batch)} of {len(syms)}")
+        for attempt in range(3):
+            try:
+                d = yf.download(batch, start=start, auto_adjust=True, progress=False, threads=True,
+                                group_by="column")
+                break
+            except Exception as e:  # rate limits etc.
+                log(f"  retry ({e})")
+                time.sleep(5 * (attempt + 1))
+        else:
+            continue
+        v = d["Volume"]
+        if isinstance(v, pd.Series):  # single ticker
+            v = v.to_frame(batch[0])
+        vols.append(v)
+        time.sleep(0.5)
+    if not vols:
+        return pd.DataFrame()
+    v = pd.concat(vols, axis=1)
+    v = v.loc[:, ~v.columns.duplicated()].replace(0, np.nan).dropna(how="all", axis=1)
+    v.index = pd.to_datetime(v.index).tz_localize(None)
+    return v.astype("float64")
+
+
+def fetch_volume(log=print) -> None:
+    """Full daily share-volume history for every symbol in close.parquet (plus the S&P 500 index).
+    Only the CAN SLIM app uses it: breakout volume and distribution / follow-through days."""
+    _, c = load_prices(supplement=False)
+    syms = list(dict.fromkeys([INDEX] + [t for t in c.columns if t not in (BENCH, TBILL)]))
+    v = _download_volume(syms, PRICE_START, log=log)
+    v.to_parquet(DATA_DIR / "volume.parquet")
+    log(f"saved volume for {v.shape[1]} symbols, {v.index[0].date()} .. {v.index[-1].date()}")
+
+
+def update_volume(log=print, overlap_days: int = 10) -> None:
+    """Recent volume for symbols still trading, merged into volume.parquet; full history for any
+    symbol in close.parquet that has none yet. Falls back to a full fetch if the file is missing."""
+    f = DATA_DIR / "volume.parquet"
+    if not f.exists():
+        return fetch_volume(log)
+    old = pd.read_parquet(f)
+    _, c = load_prices(supplement=False)
+    recent = c.index[-1] - pd.Timedelta(days=40)
+    active = [t for t in c.columns if t not in (BENCH, TBILL) and c[t].loc[recent:].notna().any()]
+    start = (old.index[-1] - pd.Timedelta(days=overlap_days)).strftime("%Y-%m-%d")
+    new = _download_volume(sorted(set(active) | {INDEX}), start, log=log)
+    missing = [t for t in active if t not in old.columns]
+    if missing:
+        new = new.drop(columns=missing, errors="ignore").join(_download_volume(missing, PRICE_START, log=log),
+                                                             how="outer")
+    v = new.combine_first(old).sort_index()
+    v.to_parquet(f)
+    log(f"volume now through {v.index[-1].date()}")
+
+
+def load_volume(supplement: bool = True) -> pd.DataFrame | None:
+    """Yahoo volume, plus the WIKI supplement's volume for the symbols load_prices supplements."""
+    f = DATA_DIR / "volume.parquet"
+    if not f.exists():
+        return None
+    v = pd.read_parquet(f)
+    sv = DATA_DIR / "supplement_volume.parquet"
+    if supplement and sv.exists():
+        s = pd.read_parquet(sv)
+        v = v.join(s[[t for t in s.columns if t not in v.columns]].reindex(v.index))
+    return v

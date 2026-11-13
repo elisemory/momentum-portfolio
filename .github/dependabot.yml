@@ -5,6 +5,13 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # CI and the refresh workflow run Python 3.11; NumPy 2.5 requires 3.12.
+      - dependency-name: numpy
+        versions: [">=2.5"]
+      # Streamlit 1.65 requires pyarrow<26. Upgrade these together.
+      - dependency-name: pyarrow
+        versions: [">=26"]
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

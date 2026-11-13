@@ -244,16 +244,24 @@ def holdings_section() -> None:
     if q is not None:
         pos["price_now"] = pos["ticker"].map(q["price"])
         pos["today"] = pos["ticker"].map(q["change"])
-        port_today = float((pos["weight"] * pos["today"].fillna(0)).sum())  # cash share earns ~0 in a day
-        spx, ndx = float(q.loc["^GSPC", "change"]), float(q.loc["^NDX", "change"])
+        # cash share earns ~0 in a day; a held stock without a quote leaves the total unknown, not flat
+        unquoted = pos.loc[pos["today"].isna(), "ticker"].tolist()
+        port_today = np.nan if unquoted else float((pos["weight"] * pos["today"]).sum())
+        spx, ndx = (float(q["change"].get(t, np.nan)) for t in ("^GSPC", "^NDX"))
+        pct = lambda v: "—" if not np.isfinite(v) else f"{v:+.2%}"  # noqa: E731
         is_open = live.market_open()
         session = "today" if is_open else f"last session ({q_day:%a %b %d})"
         k = st.columns(4)
-        k[0].metric(f"Portfolio {'today' if is_open else 'last session'}", f"{port_today:+.2%}",
-                    f"{(port_today - spx) * 100:+.2f} pts vs S&P")
-        k[1].metric(ticker_link("^GSPC", "S&P 500"), f"{spx:+.2%}",
+        label = f"Portfolio {'today' if is_open else 'last session'}"
+        if unquoted:
+            k[0].metric(label, "—", f"no quote yet for {', '.join(unquoted)}",
+                        delta_color="off", delta_arrow="off")
+        else:
+            k[0].metric(label, pct(port_today),
+                        f"{(port_today - spx) * 100:+.2f} pts vs S&P" if np.isfinite(spx) else None)
+        k[1].metric(ticker_link("^GSPC", "S&P 500"), pct(spx),
                     session, delta_color="off", delta_arrow="off")
-        k[2].metric(ticker_link("^NDX", "Nasdaq-100"), f"{ndx:+.2%}",
+        k[2].metric(ticker_link("^NDX", "Nasdaq-100"), pct(ndx),
                     session, delta_color="off", delta_arrow="off")
         k[3].metric("Market", "● Open" if is_open else "○ Closed",
                     f"quotes updated {datetime.now():%H:%M:%S}", delta_color="off", delta_arrow="off")

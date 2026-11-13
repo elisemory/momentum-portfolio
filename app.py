@@ -16,6 +16,8 @@ from momentum import backtest as bt
 from momentum import data
 from momentum import experiments as ex
 from momentum import metrics as mt
+from momentum import universes as uv
+from momentum import market_caps as mc
 
 st.set_page_config(page_title="12-1 Momentum Backtest", layout="wide")
 
@@ -50,7 +52,21 @@ def pct(x, d=1):
     return "—" if x is None or not np.isfinite(x) else f"{x * 100:.{d}f}%"
 
 
+def remember_start_choice():
+    st.session_state['start_user_selected'] = True
+
+
+@st.cache_resource(max_entries=3, show_spinner=False)
+def load_selected_market(kind, version):
+    return uv.market(kind)
+
+
 # ---------------------------------------------------------------- data presence
+current_stamp = uv.fingerprint()
+if st.session_state.get("data_stamp") != current_stamp:
+    bt.clear_caches()
+    st.session_state["data_stamp"] = current_stamp
+
 have_data = (data.DATA_DIR / "close.parquet").exists() and (data.DATA_DIR / "sp500_hist.csv").exists()
 with st.sidebar:
     st.header("Data")
@@ -92,26 +108,115 @@ with st.sidebar:
     K = lambda name: name  # noqa: E731
 
     st.header("Strategy")
+    stock_universe = st.selectbox("Pick stocks from", list(uv.LABELS), format_func=uv.LABELS.get,
+                                  key="stock_universe")
+    minimum_billions = 20.0
+    cap_source = "yfinance"
+    universe_error = None
+    if stock_universe != "sp500":
+        st.caption("Uses current listings; delisted stocks and missing price histories are omitted.")
+        if st.button("Download / refresh selected universe", key="refresh_universe"):
+            try:
+                with st.status("Fetching selected stocks…", expanded=True) as status:
+                    uv.refresh(stock_universe, log=st.write)
+                    status.update(label="Selected universe updated", state="complete")
+                bt.clear_caches()
+                st.cache_data.clear()
+                st.rerun()
+            except (ValueError, OSError, KeyError) as exc:
+                st.error(str(exc))
+        try:
+            m = load_selected_market(stock_universe, current_stamp)
+        except (FileNotFoundError, ValueError, KeyError):
+            universe_error = "Download the selected universe's data using the sidebar button."
+    if stock_universe == "market_cap":
+        cap_source = st.selectbox("Starting market-cap data", ["yfinance", "imported"],
+                                 format_func=lambda x: {"yfinance": "Yahoo Finance estimates (free)",
+                                                        "imported": "Imported historical market caps"}[x],
+                                 key="cap_source")
+        minimum_billions = st.number_input("Starting market cap above (USD billions)",
+                                           min_value=0.0, value=20.0, step=1.0, key="min_start_cap",
+                                           help="Screen once before the first trade and keep that universe fixed. "
+                                                "Zero includes every listed stock with a price at the start.")
+        if cap_source == "yfinance":
+            st.caption("Estimated cap = starting price × latest historical share count, with stock splits accounted for. "
+                       "Share counts over one year old or missing are excluded. Coverage often begins around 2015; "
+                       "try a 2016 or later start. Today's share count is never used for an earlier date.")
+        else:
+            st.caption("Uses market caps at the last market close before the first trading session. "
+                       "Missing caps are excluded; today's cap is never substituted.")
+        with st.expander("Import historical market caps"):
+            st.caption("CSV columns: date, ticker, market_cap. Values must be company market caps in USD, "
+                       "not billions. Include the closing date before your test's start; multiple dates are supported.")
+            uploaded_caps = st.file_uploader("Market-cap CSV", type=["csv"], key="market_cap_csv")
+            if st.button("Import market caps", disabled=uploaded_caps is None):
+                try:
+                    count = uv.import_caps(uploaded_caps.getvalue())
+                    st.cache_data.clear()
+                    st.success(f"Saved {count:,} market-cap observations.")
+                except (ValueError, UnicodeError, OSError) as exc:
+                    st.error(str(exc))
+            st.download_button("Download CSV template", "date,ticker,market_cap\n", "market_caps_template.csv")
     c1, c2 = st.columns(2)
     # month pickers instead of calendars: any month from Feb 1996 up to last month, type to search
     last_full = m.dates[-1].to_period("M") - 1
-    months = [str(x) for x in pd.period_range("1996-02", last_full, freq="M")]
+    earliest = max(pd.Period("1996-02", freq="M"), m.dates[0].to_period("M") + 13)
+    months = [str(x) for x in pd.period_range(earliest, last_full, freq="M")]
+    if not months:
+        st.info("At least 13 months of prices are needed. Refresh the selected universe.")
+        st.stop()
+    if st.session_state.get("start") not in months:
+        st.session_state.pop("start", None)
+    default_start = "2010-01" if "2010-01" in months else months[0]
+    if (stock_universe == "market_cap" and cap_source == "yfinance" and "2016-01" in months
+            and not st.session_state.get("start_user_selected", False)
+            and st.session_state.get("start") in (None, "2010-01")):
+        st.session_state.pop('start', None)
+        default_start = '2016-01'
     # default to Jan 2010: earlier years miss many delisted members (see FINDINGS.md section 8)
-    start_m = c1.selectbox("Start", months, index=months.index("2010-01"), key=K("start"),
+    start_m = c1.selectbox("Start", months, index=months.index(default_start), key=K("start"),
                            format_func=lambda x: pd.Period(x).strftime("%b %Y"),
+                           on_change=remember_start_choice,
                            help="The backtest starts on the first trading day of this month. Type to search, "
-                                "e.g. '2025'. Defaults to Jan 2010: before about 2010 the price data misses "
-                                "many companies that left the index, especially ones that failed.")
+                                "e.g. '2025'. Defaults to Jan 2010, or Jan 2016 for Yahoo starting-cap estimates. "
+                                "Earlier price history misses many failed or delisted companies; historical share "
+                                "counts often begin around 2015.")
     ends = ["latest"] + [str(x) for x in pd.period_range(start_m, last_full, freq="M")][::-1]
     end_m = c2.selectbox("End", ends, index=0, key=K("end"),
                          format_func=lambda x: f"Latest ({m.dates[-1]:%b %d})" if x == "latest"
                          else "End of " + pd.Period(x).strftime("%b %Y"))
     start = pd.Period(start_m).start_time.date()
     end = m.dates[-1].date() if end_m == "latest" else pd.Period(end_m).end_time.date()
-    universe = st.radio("Universe", ["pit", "current"], horizontal=True, key=K("universe"),
+    if stock_universe == "market_cap" and cap_source == "yfinance" and minimum_billions > 0 and not universe_error:
+        refresh_caps = st.button("Refresh estimated market-cap data", key="refresh_caps")
+        old_cap_manifest = mc.manifest()
+        retry_tickers = old_cap_manifest.loc[old_cap_manifest.status == 'error', 'ticker'].tolist()
+        retry_caps = st.button("Retry failed histories", disabled=not retry_tickers, key="retry_caps")
+        cap_targets = retry_tickers if retry_caps else m.tickers
+        force_caps = refresh_caps or retry_caps
+        cap_cutoff = m.dates[m.dates.searchsorted(pd.Timestamp(start)) - 1]
+        waiting = mc.pending(cap_targets, force=force_caps, cutoff=cap_cutoff)
+        if waiting:
+            with st.status("Preparing historical market-cap estimates…", expanded=True) as status:
+                try:
+                    mc.fetch(cap_targets, force=force_caps, log=st.write, cutoff=cap_cutoff)
+                except mc.DownloadLimited as exc:
+                    status.update(label="Yahoo rate limit — progress saved", state="error")
+                    st.warning(str(exc))
+                else:
+                    status.update(label="Historical share-count download finished", state="complete")
+            st.cache_data.clear()
+        cap_manifest = mc.manifest()
+        st.caption(f"{(cap_manifest.status == 'ok').sum():,} Yahoo histories cached. "
+                   "The first download can take several minutes; subsequent tests reuse the cache.")
+        failures = int((cap_manifest.status == 'error').sum())
+        if failures:
+            st.warning(f"Partial Yahoo coverage: {failures:,} downloads failed and unavailable histories are excluded. "
+                       "Use Retry failed histories after Yahoo's limit clears.")
+    universe = st.radio("S&P 500 membership", ["pit", "current"], horizontal=True, key=K("universe"),
                         format_func=lambda x: {"pit": "Point-in-time members", "current": "Today's members"}[x],
                         help="'Today's members' suffers survivorship bias: "
-                             "it only ever picks companies we already know made it into the index.")
+                             "it only ever picks companies we already know made it into the index.") if stock_universe == "sp500" else "current"
     top_n = st.slider("Basket size (top N)", 1, 50, d.top_n, key=K("top_n"))
     buffer_rank = st.slider("Hold buffer: keep while rank ≤", top_n, 150, max(d.buffer_rank, top_n), key=K("buf"),
                             help="Set equal to N to disable the buffer (strict top-N each month).")
@@ -123,8 +228,21 @@ with st.sidebar:
     cost_bps = st.number_input("Trading cost (bps per side)", 0.0, 100.0, d.cost_bps, step=5.0, key=K("cost"))
 
     st.header("Regime filter")
+    regime_index = st.selectbox("Bear-market signal index", list(uv.REGIMES),
+                                format_func=uv.REGIMES.get, key="regime_index")
+    regime_label = uv.REGIMES[regime_index]
+    if regime_index == "nasdaq100":
+        if st.button("Download / refresh Nasdaq-100 signal data"):
+            try:
+                with st.spinner("Downloading Nasdaq-100 index history…"):
+                    uv.fetch_nasdaq_index()
+                bt.clear_caches()
+                st.cache_data.clear()
+                st.rerun()
+            except (ValueError, OSError) as exc:
+                st.error(str(exc))
     regime = st.toggle("Move to T-bills in bear markets", d.regime_filter, key=K("regime"))
-    regime_rule = st.selectbox("Bear market when S&P 500 is…", list(REGIME_RULES),
+    regime_rule = st.selectbox(f"Bear market when {regime_label} is…", list(REGIME_RULES),
                                list(REGIME_RULES).index(d.regime_rule), format_func=REGIME_RULES.get,
                                disabled=not regime, key=K("rule"))
     c1, c2 = st.columns(2)
@@ -166,16 +284,39 @@ cfg = bt.Config(start=str(start), end=str(end), top_n=top_n, buffer_rank=buffer_
                 quality_gate=quality, rebalance_mode=rebal_mode, cost_bps=cost_bps, score=score,
                 sma_band=band, vol_target=vol_target, max_weight=max_weight, regime_rule=regime_rule,
                 slope_days=int(slope_days), regime_daily=regime_daily, bear_exposure=bear_exposure,
-                weighting=weighting, sector_cap=sector_cap, core_spy=core_spy, label="Strategy")
+                weighting=weighting, sector_cap=sector_cap, core_spy=core_spy, label="Strategy",
+                regime_index=regime_index, point_in_time_filter=stock_universe != "sp500")
+selection = uv.Selection(stock_universe, str(start), minimum_billions, cap_source)
+if universe_error:
+    st.info(universe_error)
+    st.stop()
+stamp = uv.fingerprint()
+
+
+@st.cache_resource(max_entries=4, show_spinner=False)
+def prepared_market(s: uv.Selection, membership_mode: str, version):
+    return uv.prepare(s, bt.Config(universe=membership_mode), load_selected_market(s.kind, version))
 
 
 @st.cache_data(show_spinner="Running backtest…", max_entries=64)
-def run_cached(c: bt.Config):
-    r = bt.run(c)
+def run_cached(c: bt.Config, s: uv.Selection, version):
+    market, membership, _ = prepared_market(s, c.universe, version)
+    with bt.using_market(market, membership):
+        r = bt.run(c)
     return r.nav, r.bench, r.cash_rate, r.rebalances, r.holdings, r.trades, r.weights_in_market
 
 
-nav, bench, rf, rebals, holdings, trades, invested = run_cached(cfg)
+try:
+    selected_market, selected_membership, selection_details = prepared_market(selection, cfg.universe, stamp)
+    nav, bench, rf, rebals, holdings, trades, invested = run_cached(cfg, selection, stamp)
+    with bt.using_market(selected_market, selected_membership):
+        sig = bt.live_signal(cfg)
+except (ValueError, FileNotFoundError) as exc:
+    st.info(str(exc))
+    st.stop()
+if nav.empty:
+    st.info("No trading sessions in the selected date range.")
+    st.stop()
 S = mt.summary(nav, rf, bench)
 B = mt.summary(bench, rf)
 
@@ -197,6 +338,18 @@ NDX_NAME = "Nasdaq-100 (QQQ, total return)"
 
 # ---------------------------------------------------------------- header + KPI tiles
 st.title("Improved 12-1 Momentum vs. S&P 500 & Nasdaq")
+st.caption(f"Stock universe: **{uv.LABELS[stock_universe]}** · Bear-market signal: **{regime_label}**")
+st.caption(f"**{regime_label} market status: {'Bull' if sig['bull'] else 'Bear'}** "
+           f"as of {sig['as_of'].date()} · selected rule: {REGIME_RULES[cfg.regime_rule]}")
+if stock_universe == "market_cap":
+    cap_label = "estimated market cap" if cap_source == "yfinance" and minimum_billions > 0 else "market cap"
+    st.caption(f"Fixed universe: {selection_details['eligible_at_start']:,} stocks at the start · "
+               f"{cap_label} above ${minimum_billions:g}B as of {selection_details['cap_cutoff']} · "
+               f"{selection_details.get('caps_available', selection_details['eligible_at_start']):,} usable starting values")
+    if cap_source == "yfinance" and minimum_billions > 0:
+        cap_audit = mc.snapshot(selection_details['cap_cutoff'], selected_market.tickers)
+        st.download_button("Download starting-cap estimates and exclusions", cap_audit.to_csv(),
+                           f"starting_caps_{selection_details['cap_cutoff']}.csv")
 st.caption(f"{nav.index[0].date()} → {nav.index[-1].date()} · total-return prices · fills at the open on the "
            f"first trading day of each month · {cost_bps:g} bps/side costs · idle cash earns 13-week T-bill yield")
 
@@ -346,11 +499,10 @@ with tabs[3]:
 
 # ---------------------------------------------------------------- live signal
 with tabs[4]:
-    sig = bt.live_signal(cfg)
     nxt = sig["next_rebalance_month"]
     st.markdown(f"Data as of **{sig['as_of'].date()}**. Next rebalance: first trading day of **{nxt}**.")
     c1, c2, c3 = st.columns(3)
-    c1.metric("S&P 500", f"{sig['spx']:,.0f}")
+    c1.metric(regime_label, f"{sig['spx']:,.0f}")
     c2.metric(f"{cfg.sma_days}-day SMA", f"{sig['sma']:,.0f}", f"{(sig['spx'] / sig['sma'] - 1) * 100:+.1f}% vs SMA",
               delta_color="off")
     c3.metric("Regime today", "▲ Bull: stay invested" if sig["bull"] else "▼ Bear: move to T-bills")
@@ -365,22 +517,25 @@ with tabs[4]:
                 "date, so treat this as a preview, not an order).")
     dropped = [t for t in last_hold if t not in set(r.loc[r["rank"] <= cfg.buffer_rank, "ticker"])]
     if dropped:
-        st.warning("Would be sold (fell below the buffer rank or left the index): " + ", ".join(dropped))
+        st.warning("Would be sold (fell below the buffer rank or left the selected universe): " + ", ".join(dropped))
     st.dataframe(r.set_index("rank").style.format({"momentum": "{:+.0%}", "score": "{:.2f}"}),
                  width="stretch", height=600)
 
 # ---------------------------------------------------------------- caveats
 with tabs[5]:
-    mem = bt._membership("pit")
-    cov = pd.Series((mem & m.has_price).sum(1) / np.maximum(mem.sum(1), 1), index=m.dates)
+    mem = selected_membership
+    cov = pd.Series((mem & selected_market.has_price).sum(1) / np.maximum(mem.sum(1), 1), index=selected_market.dates)
     cov = cov[cov.index >= "1996-01-01"]
     fig = go.Figure()
     fig.add_scatter(x=cov.index, y=cov, line=dict(color=SERIES[0], width=2), name="coverage",
                     hovertemplate="%{y:.0%}")
-    fig.update_layout(title=dict(text="Share of point-in-time S&P 500 members with Yahoo price history",
+    fig.update_layout(title=dict(text="Share of selected universe with usable prices",
                                  font=dict(size=15, color=INK)), showlegend=False)
     fig.update_yaxes(range=[0, 1.02])
     st.plotly_chart(style(fig, 280, ".0%"), width="stretch")
+    st.caption("S&P 500 supports historical or current membership. Nasdaq-100 uses today's constituents. "
+               "The market-cap universe uses current US listings, screened once using dated caps before the test start. "
+               "Delisted stocks and missing observations are omitted. A starting cap does not determine later membership.")
     st.markdown("""
 **Read these before trusting any number above.**
 
@@ -394,89 +549,99 @@ with tabs[5]:
   ~2021. Before that it passes every stock. A real test needs point-in-time fundamentals (Compustat, Sharadar, etc.).
 - **Execution.** Fills at the adjusted open with a flat cost per side. No market impact, taxes, or borrow.
   Dividends are reinvested through adjusted prices.
-- **Regime index.** The SMA filter uses the S&P 500 price index (^GSPC). The benchmark is SPY with dividends.
+- **Regime index.** The bear-market rule uses your chosen S&P 500 or Nasdaq-100 index. Benchmarks remain SPY and Nasdaq-100 total returns.
 - **The original spec's "historical profile" figures** (14–15% CAGR, −24% to −28% max drawdown, Sharpe ~1.0) are claims
   in the spec, not something this app reproduces. Compare them with what you see here.
 """)
     st.markdown("**Configuration used**")
     st.json(bt.config_dict(cfg))
+    st.json({'stock_universe': stock_universe, **selection_details})
 
 
 # ---------------------------------------------------------------- variants (rendered last: slow on first load)
 VARIANTS = ex.IMPROVED_VARIANTS
 
 with tabs[1]:
-    st.markdown("Each row changes **one knob** of the Improved strategy (sidebar settings are ignored here, "
-                "except trading cost). Every row is scored on the full period and on two independent halves; "
-                "a change is only credible if it helps in **both** halves. "
-                "▲ / ▼ = Sharpe more than 0.03 above / below the baseline in that half; ≈ = within 0.03.")
-    rows, navs, navs_p, rf_p = [], {}, {}, {}
-    base = bt.Config(**ex.IMPROVED, cost_bps=cfg.cost_bps)
-    prog = st.progress(0.0, "Running variants… (first load takes about a minute, then it's cached)")
-    for i, (name, kw) in enumerate(VARIANTS.items()):
-        row = {"Variant": name}
-        for pname, (ps, pe) in ex.PERIODS.items():
-            n_, b_, rf_, rb_, *_ = run_cached(replace(base, **kw, start=ps, end=pe, label=name))
-            s_, sb_ = mt.summary(n_, rf_), mt.summary(b_, rf_)
-            row[pname] = (s_, sb_, rb_)
-            navs_p[pname], rf_p[pname] = n_.index, rf_
-            if pname == "Full":
-                navs[name] = n_
-                bench_full = b_
-        rows.append(row)
-        prog.progress((i + 1) / len(VARIANTS), f"Running variants… {name}")
-    prog.empty()
+    if st.toggle("Run variant comparison", False):
+        if (nav.index[-1] - nav.index[0]).days < 120:
+            st.info("Choose at least four months to compare two independent halves.")
+        else:
+            st.markdown("Each row changes **one knob** of the Improved strategy (sidebar settings are ignored here, "
+                        "except universe, dates, signal index and trading cost). Every row is scored on the selected period and two independent halves; "
+                        "a change is only credible if it helps in **both** halves. "
+                        "▲ / ▼ = Sharpe more than 0.03 above / below the baseline in that half; ≈ = within 0.03.")
+            rows, navs, navs_p, rf_p = [], {}, {}, {}
+            base = bt.Config(**ex.IMPROVED, cost_bps=cfg.cost_bps, universe=cfg.universe,
+                             regime_index=cfg.regime_index, point_in_time_filter=cfg.point_in_time_filter)
+            midpoint = (nav.index[0] + (nav.index[-1] - nav.index[0]) / 2).to_period("M").start_time
+            periods = {"Full": (cfg.start, cfg.end),
+                       "First half": (cfg.start, str((midpoint - pd.Timedelta(days=1)).date())),
+                       "Second half": (str(midpoint.date()), cfg.end)}
+            prog = st.progress(0.0, "Running variants… (first load takes about a minute, then it's cached)")
+            for i, (name, kw) in enumerate(VARIANTS.items()):
+                row = {"Variant": name}
+                for pname, (ps, pe) in periods.items():
+                    n_, b_, rf_, rb_, *_ = run_cached(replace(base, **kw, start=ps, end=pe, label=name), selection, stamp)
+                    s_, sb_ = mt.summary(n_, rf_), mt.summary(b_, rf_)
+                    row[pname] = (s_, sb_, rb_)
+                    navs_p[pname], rf_p[pname] = n_.index, rf_
+                    if pname == "Full":
+                        navs[name] = n_
+                        bench_full = b_
+                rows.append(row)
+                prog.progress((i + 1) / len(VARIANTS), f"Running variants… {name}")
+            prog.empty()
 
-    baseline = rows[0]
-    nq = {}
-    for pname, (ps, pe) in ex.PERIODS.items():
-        idx_ = navs_p[pname]
-        nq[pname] = mt.summary(nasdaq_like(idx_, 100_000), rf_p[pname])
-    out = []
-    for row in rows:
-        full, h1, h2 = (row[k][0] for k in ex.PERIODS)
-        def mark(h, ref):  # Sharpe within ±0.03 of the baseline counts as a tie
-            d_ = h["Sharpe"] - ref["Sharpe"]
-            return "▲" if d_ > 0.03 else "▼" if d_ < -0.03 else "≈"
-        verdict = "—" if row is baseline else (f"96–10 {mark(h1, baseline['1996-2010'][0])}  ·  "
-                                            f"11–now {mark(h2, baseline['2011-now'][0])}")
-        out.append({"Variant": row["Variant"], "CAGR": full["CAGR"], "Sharpe": full["Sharpe"],
-                    "Max DD": full["Max drawdown"], "CAGR 96–10": h1["CAGR"], "CAGR 11–now": h2["CAGR"],
-                    "vs S&P 11–now": h2["CAGR"] - row["2011-now"][1]["CAGR"],
-                    "vs Nasdaq 11–now": h2["CAGR"] - nq["2011-now"]["CAGR"],
-                    "Turnover/yr": mt.turnover_per_year(row["Full"][2]), "Sharpe vs baseline (by half)": verdict})
-    sb = {k: rows[0][k][1] for k in ex.PERIODS}
-    out.append({"Variant": "S&P 500 (SPY)", "CAGR": sb["Full"]["CAGR"], "Sharpe": sb["Full"]["Sharpe"],
-                "Max DD": sb["Full"]["Max drawdown"], "CAGR 96–10": sb["1996-2010"]["CAGR"],
-                "CAGR 11–now": sb["2011-now"]["CAGR"], "vs S&P 11–now": 0.0,
-                "vs Nasdaq 11–now": sb["2011-now"]["CAGR"] - nq["2011-now"]["CAGR"], "Turnover/yr": np.nan,
-                "Sharpe vs baseline (by half)": ""})
-    out.append({"Variant": "Nasdaq-100 (QQQ)", "CAGR": nq["Full"]["CAGR"], "Sharpe": nq["Full"]["Sharpe"],
-                "Max DD": nq["Full"]["Max drawdown"], "CAGR 96–10": nq["1996-2010"]["CAGR"],
-                "CAGR 11–now": nq["2011-now"]["CAGR"],
-                "vs S&P 11–now": nq["2011-now"]["CAGR"] - sb["2011-now"]["CAGR"], "vs Nasdaq 11–now": 0.0,
-                "Turnover/yr": np.nan, "Sharpe vs baseline (by half)": ""})
-    tab = pd.DataFrame(out)
-    st.dataframe(tab.style.format({"CAGR": "{:.1%}", "Sharpe": "{:.2f}", "Max DD": "{:.1%}", "CAGR 96–10": "{:.1%}",
-                                   "CAGR 11–now": "{:.1%}", "vs S&P 11–now": "{:+.1%}", "vs Nasdaq 11–now": "{:+.1%}",
-                                   "Turnover/yr": "{:.0%}"},
-                                  na_rep="—"),
-                 width="stretch", height=36 * (len(tab) + 1) + 4, hide_index=True,
-                 column_config={"Variant": st.column_config.TextColumn(width="large")})
-    pick = st.multiselect("Plot (max 6, colors stay fixed per variant)", list(VARIANTS),
-                          ["Improved (baseline)", "Regime: original rule (any close below SMA)",
-                           "Regime: off (always invested)"],
-                          max_selections=6)
-    fig = go.Figure()
-    fig.add_scatter(x=bench_full.index, y=bench_full, name="S&P 500", line=dict(color=MUTED, width=2, dash="dot"),
-                    hovertemplate="$%{y:,.0f}")
-    ndx_full = nasdaq_like(bench_full.index, 100_000)
-    fig.add_scatter(x=ndx_full.index, y=ndx_full, name="Nasdaq-100", line=dict(color=MUTED, width=2, dash="dash"),
-                    hovertemplate="$%{y:,.0f}")
-    color_of = {n: SERIES[[0, 2, 3, 4, 5, 6, 7, 1][i % 8]] for i, n in enumerate(VARIANTS)}
-    for n in pick:
-        fig.add_scatter(x=navs[n].index, y=navs[n], name=n, line=dict(color=color_of[n], width=2),
-                        hovertemplate="$%{y:,.0f}")
-    fig.update_layout(title=dict(text="Growth of $100,000, 1996 → today (log scale)", font=dict(size=15, color=INK)))
-    st.plotly_chart(style(fig, 480, "$,.0f", True), width="stretch")
+            baseline = rows[0]
+            nq = {}
+            for pname, (ps, pe) in periods.items():
+                idx_ = navs_p[pname]
+                nq[pname] = mt.summary(nasdaq_like(idx_, 100_000), rf_p[pname])
+            out = []
+            for row in rows:
+                full, h1, h2 = (row[k][0] for k in periods)
+                def mark(h, ref):  # Sharpe within ±0.03 of the baseline counts as a tie
+                    d_ = h["Sharpe"] - ref["Sharpe"]
+                    return "▲" if d_ > 0.03 else "▼" if d_ < -0.03 else "≈"
+                verdict = "—" if row is baseline else (f"First half {mark(h1, baseline['First half'][0])}  ·  "
+                                                    f"Second half {mark(h2, baseline['Second half'][0])}")
+                out.append({"Variant": row["Variant"], "CAGR": full["CAGR"], "Sharpe": full["Sharpe"],
+                            "Max DD": full["Max drawdown"], "CAGR first half": h1["CAGR"], "CAGR second half": h2["CAGR"],
+                            "vs S&P second half": h2["CAGR"] - row["Second half"][1]["CAGR"],
+                            "vs Nasdaq second half": h2["CAGR"] - nq["Second half"]["CAGR"],
+                            "Turnover/yr": mt.turnover_per_year(row["Full"][2]), "Sharpe vs baseline (by half)": verdict})
+            sb = {k: rows[0][k][1] for k in periods}
+            out.append({"Variant": "S&P 500 (SPY)", "CAGR": sb["Full"]["CAGR"], "Sharpe": sb["Full"]["Sharpe"],
+                        "Max DD": sb["Full"]["Max drawdown"], "CAGR first half": sb["First half"]["CAGR"],
+                        "CAGR second half": sb["Second half"]["CAGR"], "vs S&P second half": 0.0,
+                        "vs Nasdaq second half": sb["Second half"]["CAGR"] - nq["Second half"]["CAGR"], "Turnover/yr": np.nan,
+                        "Sharpe vs baseline (by half)": ""})
+            out.append({"Variant": "Nasdaq-100 (QQQ)", "CAGR": nq["Full"]["CAGR"], "Sharpe": nq["Full"]["Sharpe"],
+                        "Max DD": nq["Full"]["Max drawdown"], "CAGR first half": nq["First half"]["CAGR"],
+                        "CAGR second half": nq["Second half"]["CAGR"],
+                        "vs S&P second half": nq["Second half"]["CAGR"] - sb["Second half"]["CAGR"], "vs Nasdaq second half": 0.0,
+                        "Turnover/yr": np.nan, "Sharpe vs baseline (by half)": ""})
+            tab = pd.DataFrame(out)
+            st.dataframe(tab.style.format({"CAGR": "{:.1%}", "Sharpe": "{:.2f}", "Max DD": "{:.1%}", "CAGR first half": "{:.1%}",
+                                           "CAGR second half": "{:.1%}", "vs S&P second half": "{:+.1%}", "vs Nasdaq second half": "{:+.1%}",
+                                           "Turnover/yr": "{:.0%}"},
+                                          na_rep="—"),
+                         width="stretch", height=36 * (len(tab) + 1) + 4, hide_index=True,
+                         column_config={"Variant": st.column_config.TextColumn(width="large")})
+            pick = st.multiselect("Plot (max 6, colors stay fixed per variant)", list(VARIANTS),
+                                  ["Improved (baseline)", "Regime: original rule (any close below SMA)",
+                                   "Regime: off (always invested)"],
+                                  max_selections=6)
+            fig = go.Figure()
+            fig.add_scatter(x=bench_full.index, y=bench_full, name="S&P 500", line=dict(color=MUTED, width=2, dash="dot"),
+                            hovertemplate="$%{y:,.0f}")
+            ndx_full = nasdaq_like(bench_full.index, 100_000)
+            fig.add_scatter(x=ndx_full.index, y=ndx_full, name="Nasdaq-100", line=dict(color=MUTED, width=2, dash="dash"),
+                            hovertemplate="$%{y:,.0f}")
+            color_of = {n: SERIES[[0, 2, 3, 4, 5, 6, 7, 1][i % 8]] for i, n in enumerate(VARIANTS)}
+            for n in pick:
+                fig.add_scatter(x=navs[n].index, y=navs[n], name=n, line=dict(color=color_of[n], width=2),
+                                hovertemplate="$%{y:,.0f}")
+            fig.update_layout(title=dict(text="Growth of $100,000 over the selected period (log scale)", font=dict(size=15, color=INK)))
+            st.plotly_chart(style(fig, 480, "$,.0f", True), width="stretch")
 

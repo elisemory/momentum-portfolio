@@ -140,6 +140,18 @@ def _download(tickers: list[str], start: str, log=print, chunk: int = 80) -> tup
     return o.loc[:, ~o.columns.duplicated()], c.loc[:, ~c.columns.duplicated()]
 
 
+def _drop_index_only_tail(o_new: pd.DataFrame, c_new: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Drop trailing sessions where Yahoo has index values but SPY and most stocks are still blank.
+    Yahoo sometimes publishes ^GSPC's daily bar hours before the equity bars; such a row is not
+    yet a session, and keeping it would fail the SPY check below (or merge in blank prices)."""
+    stocks = c_new.columns.difference(data.EXTRA)
+    keep = len(c_new)
+    while keep and (data.BENCH not in c_new or pd.isna(c_new[data.BENCH].iloc[keep - 1])) \
+            and c_new[stocks].iloc[keep - 1].notna().mean() < 0.5:
+        keep -= 1
+    return o_new.loc[o_new.index <= c_new.index[keep - 1]] if keep else o_new.iloc[:0], c_new.iloc[:keep]
+
+
 def _check_download(c_new: pd.DataFrame, members: list[str], min_coverage: float = 0.9,
                     max_lag_days: int = 3, now: datetime | None = None) -> None:
     """Raise unless the download reaches the latest completed session for the index and most current
@@ -175,11 +187,18 @@ def update_prices(log=print, overlap_days: int = 120) -> None:
     start = (c_old.index[-1] - pd.Timedelta(days=overlap_days)).strftime("%Y-%m-%d")
     log(f"updating {len(active)} active symbols since {start}")
     o_new, c_new = _download(sorted(set(active) | set(data.EXTRA)), start, log)
+    n = len(c_new)
+    o_new, c_new = _drop_index_only_tail(o_new, c_new)
+    if len(c_new) < n:
+        log(f"ignoring {n - len(c_new)} trailing session(s) with index data but no stock prices yet")
     _check_download(c_new, [t for t in data.load_membership()["tickers"].iloc[-1] if t in c_old.columns])
     if new_names:
         log(f"full history for new members: {', '.join(new_names)}")
         o_full, c_full = _download(new_names, data.PRICE_START, log)
-        o_new, c_new = pd.concat([o_new, o_full], axis=1), pd.concat([c_new, c_full], axis=1)
+        if not c_full.empty:  # same session cutoff as the checked download
+            last = c_new.index[-1]
+            o_new = pd.concat([o_new, o_full.loc[:last]], axis=1)
+            c_new = pd.concat([c_new, c_full.loc[:last]], axis=1)
 
     common = c_new.columns.intersection(c_old.columns)
     both = c_old.index.intersection(c_new.index)
@@ -291,9 +310,21 @@ def quotes(tickers: list[str]) -> tuple[pd.DataFrame, pd.Timestamp]:
     d = yf.download(tickers, period="5d", interval="1d", auto_adjust=False, progress=False, threads=True)["Close"]
     if isinstance(d, pd.Series):
         d = d.to_frame(tickers[0])
-    d = d.dropna(how="all").ffill()
-    last, prev = d.iloc[-1], d.iloc[-2]
-    return pd.DataFrame({"price": last, "prev_close": prev, "change": last / prev - 1}), d.index[-1]
+    d = d.dropna(how="all")
+    day = d.index[-1]
+    # Never forward-fill into the latest session: Yahoo can publish index bars before equity bars,
+    # and a copied close would show as a 0% day. Missing bars fall back to the cached closes.
+    last, prev = d.iloc[-1].copy(), d.iloc[:-1].ffill().iloc[-1]
+    missing = last.index[last.isna()]
+    if len(missing):
+        _, c = data.load_prices(supplement=False)
+        cached = c.reindex(columns=missing)
+        if day in cached.index:
+            before = cached.loc[:day].iloc[:-1].ffill()
+            if len(before):
+                # adjusted closes give the session's change; apply it to the unadjusted previous close
+                last[missing] = prev[missing] * cached.loc[day] / before.iloc[-1]
+    return pd.DataFrame({"price": last, "prev_close": prev, "change": last / prev - 1}), day
 
 
 def market_open(now: datetime | None = None) -> bool:

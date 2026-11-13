@@ -61,9 +61,28 @@ def build(wiki_csv: str, log=print) -> pd.DataFrame:
     return manifest
 
 
+def build_volume(wiki_csv: str, log=print) -> None:
+    """Adjusted daily volume for the supplement's symbols (the CAN SLIM app's breakout-volume rule)."""
+    use = set(pd.read_parquet(data.DATA_DIR / "supplement_close.parquet").columns)
+    parts = []
+    for chunk in pd.read_csv(wiki_csv, usecols=["ticker", "date", "adj_volume"], parse_dates=["date"],
+                             chunksize=2_000_000):
+        chunk["ticker"] = chunk["ticker"].str.replace("_", "-")
+        parts.append(chunk[chunk["ticker"].isin(use) & (chunk["date"] <= END)])
+    w = pd.concat(parts)
+    v = w.pivot(index="date", columns="ticker", values="adj_volume").sort_index().replace(0, np.nan)
+    v.astype("float64").to_parquet(data.DATA_DIR / "supplement_volume.parquet")
+    log(f"supplement volume for {v.shape[1]} symbols")
+
+
 if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--wiki", required=True, help="path to the WIKI_PRICES bulk export CSV")
-    build(ap.parse_args().wiki)
+    ap.add_argument("--volume", action="store_true", help="only build supplement_volume.parquet")
+    a = ap.parse_args()
+    if a.volume:
+        build_volume(a.wiki)
+    else:
+        build(a.wiki)
